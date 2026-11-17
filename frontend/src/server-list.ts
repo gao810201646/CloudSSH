@@ -1,18 +1,23 @@
+import { readApiJson } from './api-errors';
+import type { AppConfig } from './app-bootstrap';
 import { copyTextToClipboard } from './clipboard';
-import { maskIPAddress } from './host-display';
-import { onLocaleChange, t } from './i18n';
+import { isValidTunnelHostname, maskIPAddress } from './host-display';
+import { getLocale, onLocaleChange, t } from './i18n';
 import { osDisplayName, osIconSvg } from './os-icons';
 import { parsePort } from './port';
+import { preparePrivateKey } from './private-key-import';
+import { requestCloudflareSshCertificate } from './cf-ssh-ca';
 import { populateRegionSelect, regionLabel } from './regions';
 import { ShareManager } from './share-manager';
 import type { SSHHostInfo } from './terminal';
 import { confirmAction, notify } from './ui-feedback';
+import { formatTimestampWithRelative } from '../../src/server-memory-schema';
 
 interface UserInfo {
   id: number;
   github_id: number;
   username: string;
-  avatar_url: string;
+  avatar_url: string | null;
 }
 
 export interface ServerConfig {
@@ -22,13 +27,21 @@ export interface ServerConfig {
   host: string;
   port: number;
   username: string;
-  auth_method: 'password' | 'publickey';
+  auth_method: 'password' | 'publickey' | 'none';
   region?: string | null;
   inferred_hint?: string | null;
   tags: string[];
   /** 连接时检测到的远端操作系统（canonical key，如 ubuntu/debian/centos） */
   os?: string | null;
   jump_server_id?: number | null;
+  transport_type?: 'direct' | 'cf_tunnel';
+  cf_tunnel_host?: string | null;
+  cf_access_client_id?: string | null;
+  has_cf_access_client_secret?: boolean;
+  /** Cloudflare Zero Trust SSH CA 团队标识（非空表示使用原生 SSH CA 短期证书认证） */
+  cf_ssh_ca_team?: string | null;
+  /** 最近连接成功的 Unix 毫秒时间戳 */
+  last_connected_at?: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -38,11 +51,16 @@ interface ServerSavePayload {
   host: string;
   port: number;
   username: string;
-  auth_method: 'password' | 'publickey';
+  auth_method: 'password' | 'publickey' | 'none';
   tags: string[];
   credential?: string;
   region?: string;
   jump_server_id?: number | null;
+  transport_type?: 'direct' | 'cf_tunnel';
+  cf_tunnel_host?: string;
+  cf_access_client_id?: string;
+  cf_access_client_secret?: string;
+  cf_ssh_ca_team?: string | null;
 }
 
 interface ServerSaveResponse {
@@ -50,9 +68,12 @@ interface ServerSaveResponse {
   _debug?: unknown;
 }
 
-export const SERVER_PAGE_SIZE = 9;
+export const SERVER_PAGE_SIZE = 6;
 export const TABLET_SERVER_PAGE_SIZE = 6;
 export const MOBILE_SERVER_PAGE_SIZE = 3;
+
+export type ServerSortMode = 'recent' | 'updated' | 'created' | 'name';
+export const SERVER_SORT_STORAGE_KEY = 'cloudssh_server_sort';
 
 export function resolveServerPageSize(viewportWidth: number, coarsePointer: boolean): number {
   if (viewportWidth < 768) return MOBILE_SERVER_PAGE_SIZE;
@@ -115,6 +136,51 @@ export function paginateServers(
   };
 }
 
+export function sortServers(
+  servers: readonly ServerConfig[],
+  sortMode: ServerSortMode = 'recent'
+): ServerConfig[] {
+  const list = [...servers];
+  switch (sortMode) {
+    case 'recent':
+      return list.sort((a, b) => {
+        const aConnected = a.last_connected_at ?? 0;
+        const bConnected = b.last_connected_at ?? 0;
+        if (aConnected !== bConnected) {
+          return bConnected - aConnected;
+        }
+        const aUpdated = a.updated_at ? new Date(a.updated_at).getTime() : 0;
+        const bUpdated = b.updated_at ? new Date(b.updated_at).getTime() : 0;
+        if (aUpdated !== bUpdated && !Number.isNaN(aUpdated) && !Number.isNaN(bUpdated)) {
+          return bUpdated - aUpdated;
+        }
+        return 0;
+      });
+    case 'updated':
+      return list.sort((a, b) => {
+        const aUpdated = a.updated_at ? new Date(a.updated_at).getTime() : 0;
+        const bUpdated = b.updated_at ? new Date(b.updated_at).getTime() : 0;
+        if (aUpdated !== bUpdated && !Number.isNaN(aUpdated) && !Number.isNaN(bUpdated)) {
+          return bUpdated - aUpdated;
+        }
+        return 0;
+      });
+    case 'created':
+      return list.sort((a, b) => {
+        const aCreated = a.created_at ? new Date(a.created_at).getTime() : 0;
+        const bCreated = b.created_at ? new Date(b.created_at).getTime() : 0;
+        if (aCreated !== bCreated && !Number.isNaN(aCreated) && !Number.isNaN(bCreated)) {
+          return bCreated - aCreated;
+        }
+        return 0;
+      });
+    case 'name':
+      return list.sort((a, b) => a.name.localeCompare(b.name));
+    default:
+      return list;
+  }
+}
+
 /**
  * 用户空间 — 服务器列表管理组件
  */
@@ -125,22 +191,41 @@ export class ServerList {
   private onConnect: (wsUrl: string, serverName: string, hostInfo?: SSHHostInfo) => void;
   private editingServerId: number | null = null;
   private editingOriginalAuthMethod: ServerConfig['auth_method'] | null = null;
-  private modalAuthMode: 'password' | 'key' = 'password';
+  /** 入口隐藏时保留已存团队标识，避免普通编辑把 cf_ssh_ca_team 清成 null。 */
+  private editingOriginalCfTeam: string | null = null;
+  private modalAuthMode: 'password' | 'key' | 'none' | 'cf_ca' = 'password';
+  private modalTransportMode: 'direct' | 'cf_tunnel' = 'direct';
+  private modalGeneration = 0;
+  private clearCfAccessClientSecret = false;
   private searchQuery = '';
   private selectedTag = '';
+  private sortMode: ServerSortMode = 'recent';
   private currentPage = 1;
   private pageSize = currentServerPageSize();
   private sharingEnabled = false;
+  /** 与连接表单一致：只有 Cloudflare Access 登录才显示 SSH CA 入口。 */
+  private cfSshCaEnabled = false;
   private readonly shareManager = new ShareManager();
 
   constructor(
     user: UserInfo,
     onLogout: () => void,
-    onConnect: (wsUrl: string, serverName: string, hostInfo?: SSHHostInfo) => void
+    onConnect: (wsUrl: string, serverName: string, hostInfo?: SSHHostInfo) => void,
+    config: AppConfig
   ) {
     this.user = user;
     this.onLogout = onLogout;
     this.onConnect = onConnect;
+    this.sharingEnabled = config.sshSharingEnabled === true;
+    this.cfSshCaEnabled = config.authMode === 'cf_access';
+    try {
+      const savedSort = localStorage.getItem(SERVER_SORT_STORAGE_KEY) as ServerSortMode | null;
+      if (savedSort && ['recent', 'updated', 'created', 'name'].includes(savedSort)) {
+        this.sortMode = savedSort;
+      }
+    } catch {
+      /* ignore */
+    }
     onLocaleChange(() => this.renderServerGrid());
     this.init();
   }
@@ -148,7 +233,9 @@ export class ServerList {
   private async init(): Promise<void> {
     this.renderUserInfo();
     this.bindEvents();
-    await Promise.all([this.fetchSharingConfig(), this.fetchServers()]);
+    this.applyCfSshCaAvailability();
+    this.renderSkeletonGrid();
+    await this.fetchServers();
     this.renderServerGrid();
 
     // 设置用户空间的版权年份
@@ -162,6 +249,17 @@ export class ServerList {
     this.pageSize = nextPageSize;
     this.currentPage = 1;
     this.renderServerGrid();
+  }
+
+  /** 用户切回主页或重新展示时调用：先使用内存状态即时重排，再静默拉取后台最新数据同步 */
+  async refresh(): Promise<void> {
+    this.renderServerGrid();
+    try {
+      await this.fetchServers();
+      this.renderServerGrid();
+    } catch {
+      /* ignore network errors to keep memory state intact */
+    }
   }
 
   /** 连接后由 os_detected 消息回调：更新某台服务器的操作系统并即时重渲染图标 */
@@ -179,11 +277,21 @@ export class ServerList {
     if (!container) return;
 
     container.innerHTML = '';
-    const img = document.createElement('img');
-    img.src = this.user.avatar_url;
-    img.alt = this.user.username;
-    img.className = 'user-avatar w-8 h-8';
-    container.appendChild(img);
+    if (this.user.avatar_url) {
+      const img = document.createElement('img');
+      img.src = this.user.avatar_url;
+      img.alt = this.user.username;
+      img.className = 'user-avatar w-8 h-8';
+      container.appendChild(img);
+    } else {
+      // 本地管理员（密码模式）无头像：首字母回退块，复用同款描边样式
+      const fallback = document.createElement('span');
+      fallback.className =
+        'user-avatar w-8 h-8 flex items-center justify-center text-[11px] font-bold text-muted select-none';
+      fallback.textContent = (this.user.username || 'A').slice(0, 1).toUpperCase();
+      fallback.setAttribute('aria-hidden', 'true');
+      container.appendChild(fallback);
+    }
     const span = document.createElement('span');
     span.className = 'text-xs font-bold tracking-[0.1em] text-muted';
     span.textContent = this.user.username;
@@ -229,6 +337,23 @@ export class ServerList {
         this.renderServerGrid();
       }
     );
+    const sortSelect = document.getElementById('server-sort') as HTMLSelectElement | null;
+    if (sortSelect) {
+      sortSelect.value = this.sortMode;
+      sortSelect.addEventListener('change', () => {
+        const mode = sortSelect.value as ServerSortMode;
+        if (['recent', 'updated', 'created', 'name'].includes(mode)) {
+          this.sortMode = mode;
+          try {
+            localStorage.setItem(SERVER_SORT_STORAGE_KEY, mode);
+          } catch {
+            /* ignore */
+          }
+          this.currentPage = 1;
+          this.renderServerGrid();
+        }
+      });
+    }
     document.getElementById('server-page-prev')?.addEventListener('click', () => {
       this.currentPage--;
       this.renderServerGrid();
@@ -254,6 +379,10 @@ export class ServerList {
       void this.handleSubmit();
     });
 
+    document.getElementById('server-empty-password')?.addEventListener('change', () => {
+      this.setModalAuthMode(this.modalAuthMode);
+    });
+
     // Modal 认证方式切换
     document
       .getElementById('modal-auth-tab-password')
@@ -262,8 +391,35 @@ export class ServerList {
       .getElementById('modal-auth-tab-key')
       ?.addEventListener('click', () => this.setModalAuthMode('key'));
     document
+      .getElementById('modal-auth-tab-cf-ca')
+      ?.addEventListener('click', () => this.setModalAuthMode('cf_ca'));
+    document
+      .getElementById('modal-auth-tab-none')
+      ?.addEventListener('click', () => this.setModalAuthMode('none'));
+    document
+      .getElementById('modal-transport-tab-direct')
+      ?.addEventListener('click', () => this.setModalTransportMode('direct'));
+    document
+      .getElementById('modal-transport-tab-tunnel')
+      ?.addEventListener('click', () => this.setModalTransportMode('cf_tunnel'));
+    document
       .getElementById('server-jump-host')
       ?.addEventListener('change', () => this.updateRegionControls());
+    document.getElementById('server-cf-access-toggle')?.addEventListener('click', () => {
+      const fields = document.getElementById('server-cf-access-fields');
+      this.setCfAccessFieldsOpen(fields?.classList.contains('hidden') ?? true);
+    });
+    document
+      .getElementById('server-cf-clear-secret-btn')
+      ?.addEventListener('click', () => this.handleClearCfSecret());
+    document.getElementById('server-cf-client-secret')?.addEventListener('input', () => {
+      this.clearCfAccessClientSecret = false;
+      const statusEl = document.getElementById('server-cf-secret-status');
+      if (statusEl) {
+        statusEl.textContent = '';
+        statusEl.classList.add('hidden');
+      }
+    });
   }
 
   // ==================== 数据获取 ====================
@@ -285,15 +441,10 @@ export class ServerList {
     }
   }
 
-  private async fetchSharingConfig(): Promise<void> {
-    try {
-      const response = await fetch('/api/config');
-      if (!response.ok) return;
-      const config = (await response.json()) as { sshSharingEnabled?: boolean };
-      this.sharingEnabled = config.sshSharingEnabled === true;
-    } catch {
-      this.sharingEnabled = false;
-    }
+  private applyCfSshCaAvailability(): void {
+    document
+      .getElementById('modal-auth-tab-cf-ca')
+      ?.classList.toggle('hidden', !this.cfSshCaEnabled);
   }
 
   // ==================== 渲染服务器卡片 ====================
@@ -308,6 +459,7 @@ export class ServerList {
     const tagFilter = document.getElementById('server-tag-filter') as HTMLSelectElement | null;
     const pagination = document.getElementById('server-pagination');
     if (!grid || !emptyState || !searchWrapper || !searchEmptyState) return;
+    grid.removeAttribute('aria-busy');
 
     if (this.servers.length === 0) {
       grid.innerHTML = '';
@@ -342,6 +494,11 @@ export class ServerList {
       tagFilter.value = this.selectedTag;
     }
 
+    const sortSelect = document.getElementById('server-sort') as HTMLSelectElement | null;
+    if (sortSelect && sortSelect.value !== this.sortMode) {
+      sortSelect.value = this.sortMode;
+    }
+
     const filteredServers = filterServers(this.servers, this.searchQuery, this.selectedTag);
     if (filteredServers.length === 0) {
       grid.innerHTML = '';
@@ -355,15 +512,18 @@ export class ServerList {
     searchEmptyState.classList.add('hidden');
     searchEmptyState.classList.remove('flex');
 
-    const page = paginateServers(filteredServers, this.currentPage, this.pageSize);
+    const sortedServers = sortServers(filteredServers, this.sortMode);
+    const page = paginateServers(sortedServers, this.currentPage, this.pageSize);
     this.currentPage = page.currentPage;
     const visibleServers = page.items;
 
     // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
-    grid.innerHTML = visibleServers.map((server) => this.renderServerCard(server)).join('');
+    grid.innerHTML = visibleServers
+      .map((server, index) => this.renderServerCard(server, index, this.searchQuery === ''))
+      .join('');
 
     // 绑定卡片事件
-    visibleServers.forEach((server) => {
+    for (const server of visibleServers) {
       document
         .getElementById(`connect-${server.id}`)
         ?.addEventListener('click', () => this.connectServer(server.id));
@@ -392,7 +552,7 @@ export class ServerList {
           }
         });
       }
-    });
+    }
 
     if (page.totalPages > 1) {
       pagination?.classList.remove('hidden');
@@ -415,6 +575,22 @@ export class ServerList {
     }
   }
 
+  /** 冷加载骨架屏：按当前分页尺寸渲染占位卡片，fetchServers 完成后由 renderServerGrid 整体替换 */
+  private renderSkeletonGrid(): void {
+    const grid = document.getElementById('server-grid');
+    if (!grid) return;
+    grid.setAttribute('aria-busy', 'true');
+    const skeletonCard = `<div class="skeleton-card" aria-hidden="true">
+      <div class="skeleton-line" style="width: 55%"></div>
+      <div class="skeleton-line" style="width: 80%"></div>
+      <div class="skeleton-line" style="width: 70%"></div>
+      <div class="skeleton-line" style="width: 75%"></div>
+      <div class="skeleton-line" style="width: 100%; height: 28px; margin-top: 8px"></div>
+    </div>`;
+    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+    grid.innerHTML = Array.from({ length: this.pageSize }, () => skeletonCard).join('');
+  }
+
   /** 渲染服务器名称前的图标：已识别操作系统 → 品牌 SVG，否则回退到默认 dns 图标 */
   private renderOSIconMarkup(os: string | null | undefined): string {
     const svg = osIconSvg(os);
@@ -425,22 +601,53 @@ export class ServerList {
     return `<span class="material-symbols-outlined text-primary shrink-0" style="font-size: 20px; font-variation-settings: 'FILL' 0;">dns</span>`;
   }
 
-  private renderServerCard(server: ServerConfig): string {
-    const authIcon = server.auth_method === 'publickey' ? 'vpn_key' : 'password';
-    const authLabel = server.auth_method === 'publickey' ? 'KEY' : 'PWD';
+  private renderServerCard(server: ServerConfig, index = 0, animate = false): string {
+    const isCfCa = this.cfSshCaEnabled && Boolean(server.cf_ssh_ca_team);
+    const authIcon = isCfCa
+      ? 'verified_user'
+      : server.auth_method === 'none'
+        ? 'person'
+        : server.auth_method === 'publickey'
+          ? 'vpn_key'
+          : 'password';
+    const authLabel = isCfCa
+      ? 'CF CA'
+      : server.auth_method === 'none'
+        ? 'NONE'
+        : server.auth_method === 'publickey'
+          ? 'KEY'
+          : 'PWD';
+    const isTunnel = server.transport_type === 'cf_tunnel';
+    const tunnelBadge = isTunnel
+      ? `<span class="shrink-0 text-[10px] font-bold tracking-[0.1em] text-[var(--accent-secondary)] border border-[var(--accent-secondary)] px-1.5 py-0.5">${t('server.tunnelBadge')}</span>`
+      : '';
 
     // 下游节点自身的区域不参与调度；连接区域始终由跳板链入口决定。
-    const usesJumpHost = server.jump_server_id !== null && server.jump_server_id !== undefined;
+    const usesJumpHost = !isTunnel && server.jump_server_id !== null && server.jump_server_id !== undefined;
     const effectiveHint = usesJumpHost ? '' : server.region || server.inferred_hint || '';
     const isManual = !!server.region;
-    const regionLabelText = usesJumpHost ? t('server.regionViaJump') : regionLabel(effectiveHint);
-    const regionTag = usesJumpHost
-      ? t('server.regionInherited')
-      : effectiveHint
-        ? isManual
-          ? t('server.regionManual')
-          : t('server.regionAuto')
-        : t('server.regionAuto');
+    let regionLabelText = regionLabel('');
+    if (usesJumpHost) {
+      regionLabelText = t('server.regionViaJump');
+    } else if (effectiveHint) {
+      regionLabelText = regionLabel(effectiveHint);
+    } else if (isTunnel) {
+      regionLabelText = t('region.autoShort');
+    }
+    let regionTag = t('server.regionAuto');
+    if (usesJumpHost) {
+      regionTag = t('server.regionInherited');
+    } else if (isManual && (isTunnel || effectiveHint)) {
+      regionTag = t('server.regionManual');
+    }
+    let regionIcon = 'explore';
+    if (isTunnel) {
+      regionIcon = 'cloud';
+    } else if (usesJumpHost) {
+      regionIcon = 'route';
+    } else if (effectiveHint) {
+      regionIcon = 'my_location';
+    }
     const tagMarkup =
       (server.tags || []).length > 0
         ? `<div class="flex flex-wrap gap-1 mt-3">${server.tags
@@ -459,11 +666,14 @@ export class ServerList {
         </div>`
         : '';
 
-    const maskedHost = maskIPAddress(server.host);
+    const lastConnectedText = server.last_connected_at
+      ? formatTimestampWithRelative(server.last_connected_at, Date.now(), getLocale())
+      : t('server.neverConnected');
+
+    const maskedHost = isTunnel ? null : maskIPAddress(server.host);
     const copyIPLabel = this.escapeAttr(t('server.clickToCopyIP'));
-    const hostDisplay = maskedHost
-      ? `<button type="button" class="host-ip-badge server-host-badge min-w-0 truncate" id="host-badge-${server.id}" title="${copyIPLabel}" aria-label="${copyIPLabel}">${this.escapeHtml(maskedHost)}:${server.port}</button>`
-      : `<span class="text-on-surface min-w-0 truncate">${this.escapeHtml(server.host)}:${server.port}</span>`;
+    // 隧道连接只看域名（实际端口由内网 cloudflared 配置决定）：卡片不展示端口
+    const hostDisplay = `<button type="button" class="host-ip-badge server-host-badge min-w-0 truncate" id="host-badge-${server.id}" title="${copyIPLabel}" aria-label="${copyIPLabel}">${this.escapeHtml(maskedHost ?? server.host)}${isTunnel ? '' : `:${server.port}`}</button>`;
     const shareButton = this.sharingEnabled
       ? `<button id="share-${server.id}" class="cyber-button text-primary py-1.5 px-3 text-[10px] font-bold tracking-[0.1em] flex items-center justify-center" title="${t('share.create')}">
           <span class="material-symbols-outlined" style="font-size:14px">share</span>
@@ -471,7 +681,7 @@ export class ServerList {
       : '';
 
     return `
-      <div class="server-card p-5 relative group" id="card-${server.id}">
+      <div class="server-card p-5 relative group${animate ? ' server-card--enter' : ''}" id="card-${server.id}"${animate ? ` style="--stagger-index: ${index}"` : ''}>
         <div class="absolute top-0 left-0 w-full h-[2px] bg-gradient-to-r from-transparent via-[var(--border-strong)] to-transparent group-hover:via-[var(--accent)] transition-all duration-300"></div>
 
         <div class="flex items-start justify-between gap-2 mb-3">
@@ -479,10 +689,13 @@ export class ServerList {
             ${this.renderOSIconMarkup(server.os)}
             <h3 class="server-card-title text-sm font-bold text-primary tracking-[0.05em] truncate min-w-0" title="${this.escapeAttr(server.name)}">${this.escapeHtml(server.name)}</h3>
           </div>
-          <span class="shrink-0 text-[10px] font-bold tracking-[0.1em] text-muted border border-dim px-2 py-0.5 flex items-center gap-1">
-            <span class="material-symbols-outlined" style="font-size: 12px;">${authIcon}</span>
-            ${authLabel}
-          </span>
+          <div class="flex items-center gap-1.5 shrink-0">
+            ${tunnelBadge}
+            <span class="shrink-0 text-[10px] font-bold tracking-[0.1em] text-muted border border-dim px-2 py-0.5 flex items-center gap-1">
+              <span class="material-symbols-outlined" style="font-size: 12px;">${authIcon}</span>
+              ${authLabel}
+            </span>
+          </div>
         </div>
 
         <div class="space-y-1.5 text-xs text-muted mb-4">
@@ -498,10 +711,14 @@ export class ServerList {
           <div class="server-card-region-row flex items-center gap-2 min-w-0">
             <span class="text-dim">${t('server.regionLabel')}</span>
             <span class="text-on-surface flex items-center gap-1">
-              <span class="material-symbols-outlined" style="font-size: 11px; color: var(--accent-secondary);">${usesJumpHost ? 'route' : effectiveHint ? 'my_location' : 'explore'}</span>
+              <span class="material-symbols-outlined" style="font-size: 11px; color: var(--accent-secondary);">${regionIcon}</span>
               ${this.escapeHtml(regionLabelText)}
             </span>
             <span class="text-[9px] text-dim border border-dim px-1 py-0.5 ml-0.5">${regionTag}</span>
+          </div>
+          <div class="server-card-meta-row flex items-center gap-2 min-w-0">
+            <span class="text-dim">${t('server.lastConnected')}</span>
+            <span class="text-on-surface min-w-0 truncate" title="${this.escapeAttr(lastConnectedText)}">${this.escapeHtml(lastConnectedText)}</span>
           </div>
           ${tagMarkup}
         </div>
@@ -543,20 +760,33 @@ export class ServerList {
     }
 
     try {
-      const res = await fetch(`/api/servers/${serverId}/connect`, {
-        method: 'POST',
-      });
-
-      if (!res.ok) {
-        const ct = res.headers.get('content-type') || '';
-        if (ct.includes('application/json')) {
-          const err = (await res.json()) as { error?: string };
-          throw new Error(err.error || 'Connection failed');
+      let ephemeralCredential: string | undefined;
+      if (server.cf_ssh_ca_team) {
+        if (connectBtn) {
+          // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+          connectBtn.innerHTML = `
+            <span class="material-symbols-outlined animate-spin" style="font-size: 14px;">progress_activity</span>
+            ${t('auth.cfMinting')}
+          `;
         }
-        throw new Error(`服务器错误 (${res.status})`);
+        const creds = await requestCloudflareSshCertificate(server.cf_ssh_ca_team);
+        ephemeralCredential = `${creds.privateKey}\n${creds.certificate}`;
       }
 
-      const { wsUrl } = (await res.json()) as { wsUrl: string };
+      const res = await fetch(`/api/servers/${serverId}/connect`, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: ephemeralCredential ? { 'Content-Type': 'application/json' } : undefined,
+        body: ephemeralCredential ? JSON.stringify({ ephemeralCredential }) : undefined,
+      });
+
+      const { wsUrl } = await readApiJson<{ wsUrl: string }>(res, 'api.requestFailed');
+
+      // 连接凭证获取成功：记录最新连接时间并在最近连接排序下就地重置至首屏
+      server.last_connected_at = Date.now();
+      if (this.sortMode === 'recent') {
+        this.currentPage = 1;
+      }
 
       // 在当前页面内创建新标签并连接
       this.onConnect(wsUrl, server.name, {
@@ -564,6 +794,7 @@ export class ServerList {
         port: server.port,
         username: server.username,
         serverId: server.id,
+        cfSshCaTeam: server.cf_ssh_ca_team || undefined,
       });
     } catch (e) {
       notify(e instanceof Error ? e.message : String(e), {
@@ -624,20 +855,26 @@ export class ServerList {
   // ==================== Modal 操作 ====================
 
   showModal(mode: 'add' | 'edit' | 'clone', server?: ServerConfig): void {
+    this.modalGeneration++;
     this.editingServerId = mode === 'edit' && server ? server.id : null;
     this.editingOriginalAuthMethod = mode === 'edit' && server ? server.auth_method : null;
+    this.editingOriginalCfTeam =
+      mode === 'edit' && server?.cf_ssh_ca_team ? server.cf_ssh_ca_team : null;
 
     const modal = document.getElementById('server-modal');
     const title = document.getElementById('modal-title');
     const submitBtn = document.getElementById('server-submit-btn');
     if (!modal || !title || !submitBtn) return;
+    (submitBtn as HTMLButtonElement).disabled = false;
+    (document.getElementById('server-empty-password') as HTMLInputElement).checked = false;
 
-    title.textContent =
-      mode === 'add'
-        ? t('server.add')
-        : mode === 'clone'
-          ? t('server.cloneTitle')
-          : t('server.edit');
+    if (mode === 'add') {
+      title.textContent = t('server.add');
+    } else if (mode === 'clone') {
+      title.textContent = t('server.cloneTitle');
+    } else {
+      title.textContent = t('server.edit');
+    }
     // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
     submitBtn.innerHTML = `
       <span class="material-symbols-outlined" style="font-size: 18px;">save</span>
@@ -654,14 +891,56 @@ export class ServerList {
       (document.getElementById('server-username') as HTMLInputElement).value = server.username;
       (document.getElementById('server-password') as HTMLInputElement).value = '';
       (document.getElementById('server-private-key') as HTMLTextAreaElement).value = '';
+      const cfCaInput = document.getElementById('server-cf-ca-team') as HTMLInputElement | null;
+      if (cfCaInput) cfCaInput.value = server.cf_ssh_ca_team || '';
       (document.getElementById('server-tags') as HTMLInputElement).value = (server.tags || []).join(
         ', '
       );
 
-      if (server.auth_method === 'publickey') {
-        this.setModalAuthMode('key');
-      } else {
-        this.setModalAuthMode('password');
+      this.setModalAuthMode(
+        this.cfSshCaEnabled && server.cf_ssh_ca_team
+          ? 'cf_ca'
+          : server.auth_method === 'publickey'
+            ? 'key'
+            : server.auth_method === 'none'
+              ? 'none'
+              : 'password'
+      );
+
+      const transport = server.transport_type === 'cf_tunnel' ? 'cf_tunnel' : 'direct';
+      this.setModalTransportMode(transport);
+
+      this.clearCfAccessClientSecret = false;
+      const secretStatusEl = document.getElementById('server-cf-secret-status');
+      if (secretStatusEl) {
+        secretStatusEl.textContent = '';
+        secretStatusEl.classList.add('hidden');
+      }
+      const clearBtn = document.getElementById('server-cf-clear-secret-btn');
+      if (clearBtn) {
+        // 克隆体没有已存密钥可清除，显示该按钮会与「重新输入」提示互相冲突
+        clearBtn.classList.toggle(
+          'hidden',
+          mode === 'clone' || !server.has_cf_access_client_secret
+        );
+      }
+
+      const clientIdInput = document.getElementById('server-cf-client-id') as HTMLInputElement | null;
+      const clientSecretInput = document.getElementById(
+        'server-cf-client-secret'
+      ) as HTMLInputElement | null;
+      if (clientIdInput) clientIdInput.value = server.cf_access_client_id || '';
+      if (clientSecretInput) {
+        clientSecretInput.value = '';
+        if (mode === 'clone' && server.has_cf_access_client_secret) {
+          clientSecretInput.placeholder = t('server.reenterSecretOnClone');
+        } else {
+          clientSecretInput.placeholder = server.has_cf_access_client_secret ? '••••••••' : '';
+        }
+      }
+      if (mode === 'clone' && server.has_cf_access_client_secret && secretStatusEl) {
+        secretStatusEl.textContent = t('server.cloneSecretHint');
+        secretStatusEl.classList.remove('hidden');
       }
 
       // 区域下拉：回显用户保存的 region（"" = Auto）
@@ -682,8 +961,29 @@ export class ServerList {
       (document.getElementById('server-username') as HTMLInputElement).value = '';
       (document.getElementById('server-password') as HTMLInputElement).value = '';
       (document.getElementById('server-private-key') as HTMLTextAreaElement).value = '';
+      const cfCaInput = document.getElementById('server-cf-ca-team') as HTMLInputElement | null;
+      if (cfCaInput) cfCaInput.value = '';
       (document.getElementById('server-tags') as HTMLInputElement).value = '';
       this.setModalAuthMode('password');
+      this.setModalTransportMode('direct');
+
+      this.clearCfAccessClientSecret = false;
+      const secretStatusEl = document.getElementById('server-cf-secret-status');
+      if (secretStatusEl) {
+        secretStatusEl.textContent = '';
+        secretStatusEl.classList.add('hidden');
+      }
+      document.getElementById('server-cf-clear-secret-btn')?.classList.add('hidden');
+
+      const clientIdInput = document.getElementById('server-cf-client-id') as HTMLInputElement | null;
+      const clientSecretInput = document.getElementById(
+        'server-cf-client-secret'
+      ) as HTMLInputElement | null;
+      if (clientIdInput) clientIdInput.value = '';
+      if (clientSecretInput) {
+        clientSecretInput.value = '';
+        clientSecretInput.placeholder = '';
+      }
 
       // 新增时：region 默认 Auto，无系统推断可显示
       const regionSelect = document.getElementById('server-region') as HTMLSelectElement | null;
@@ -696,14 +996,16 @@ export class ServerList {
 
     modal.classList.remove('hidden');
     modal.classList.add('flex');
+    const fields = modal.querySelector<HTMLElement>('.server-modal-fields');
+    if (fields) fields.scrollTop = 0;
 
-    // 聚焦第一个输入框
-    setTimeout(() => {
-      (document.getElementById('server-name') as HTMLInputElement)?.focus();
-    }, 100);
+    // Focus synchronously once visible: a delayed callback can steal focus from a
+    // field the user has already started editing, or from a newer dialog.
+    (document.getElementById('server-name') as HTMLInputElement)?.focus({ preventScroll: true });
   }
 
   hideModal(): void {
+    this.modalGeneration++;
     const modal = document.getElementById('server-modal');
     if (modal) {
       modal.classList.add('hidden');
@@ -713,17 +1015,101 @@ export class ServerList {
     this.editingOriginalAuthMethod = null;
   }
 
-  private setModalAuthMode(mode: 'password' | 'key'): void {
-    this.modalAuthMode = mode;
-    const pwTab = document.getElementById('modal-auth-tab-password')!;
-    const keyTab = document.getElementById('modal-auth-tab-key')!;
-    const pwSection = document.getElementById('modal-password-section')!;
-    const keySection = document.getElementById('modal-key-section')!;
+  private setModalTransportMode(mode: 'direct' | 'cf_tunnel'): void {
+    this.modalTransportMode = mode;
+    const directTab = document.getElementById('modal-transport-tab-direct');
+    const tunnelTab = document.getElementById('modal-transport-tab-tunnel');
+    const jumpSection = document.getElementById('server-jump-host-section');
+    const regionSection = document.getElementById('server-region-section');
+    const cfAccessSection = document.getElementById('server-cf-access-section');
+    const hostLabel = document.getElementById('server-host-label');
+    const hostInput = document.getElementById('server-host') as HTMLInputElement | null;
+    const hostField = document.getElementById('server-host-field');
+    const portField = document.getElementById('server-port-field');
+    const portInput = document.getElementById('server-port') as HTMLInputElement | null;
 
-    pwTab.classList.toggle('auth-tab-active', mode === 'password');
-    keyTab.classList.toggle('auth-tab-active', mode === 'key');
-    pwSection.style.display = mode === 'password' ? '' : 'none';
-    keySection.style.display = mode === 'key' ? '' : 'none';
+    directTab?.classList.toggle('auth-tab-active', mode === 'direct');
+    tunnelTab?.classList.toggle('auth-tab-active', mode === 'cf_tunnel');
+
+    const isTunnel = mode === 'cf_tunnel';
+    if (isTunnel) {
+      if (jumpSection) jumpSection.style.display = 'none';
+      if (regionSection) regionSection.style.display = '';
+      if (cfAccessSection) cfAccessSection.classList.remove('hidden');
+      this.setCfAccessFieldsOpen(false);
+      if (hostLabel) hostLabel.textContent = t('server.tunnelHost');
+      if (hostInput) hostInput.placeholder = t('server.tunnelHostPlaceholder');
+    } else {
+      if (jumpSection) jumpSection.style.display = '';
+      if (regionSection) regionSection.style.display = '';
+      if (cfAccessSection) cfAccessSection.classList.add('hidden');
+      if (hostLabel) hostLabel.textContent = t('auth.host');
+      if (hostInput) hostInput.placeholder = '192.168.1.1';
+    }
+
+    // 隧道连接只看域名（实际端口由内网 cloudflared 配置决定）：隐藏端口字段，域名输入占满整行；
+    // 隐藏时同步移除 required，避免空值阻断表单校验（保存时端口回落 22，仅作存储记录）
+    if (portField) portField.style.display = isTunnel ? 'none' : '';
+    if (portInput) portInput.required = !isTunnel;
+    hostField?.classList.toggle('ssh-host-field-wide', isTunnel);
+
+    this.updateRegionControls();
+  }
+
+  private setCfAccessFieldsOpen(open: boolean): void {
+    const fields = document.getElementById('server-cf-access-fields');
+    const toggle = document.getElementById('server-cf-access-toggle');
+    const chevron = document.getElementById('server-cf-access-chevron');
+    fields?.classList.toggle('hidden', !open);
+    toggle?.setAttribute('aria-expanded', String(open));
+    if (chevron) chevron.textContent = open ? 'expand_less' : 'expand_more';
+  }
+
+  private handleClearCfSecret(): void {
+    this.clearCfAccessClientSecret = true;
+    const secretInput = document.getElementById(
+      'server-cf-client-secret'
+    ) as HTMLInputElement | null;
+    const statusEl = document.getElementById('server-cf-secret-status');
+    const clearBtn = document.getElementById('server-cf-clear-secret-btn');
+    if (secretInput) {
+      secretInput.value = '';
+      secretInput.placeholder = '';
+    }
+    if (statusEl) {
+      statusEl.textContent = t('server.secretCleared');
+      statusEl.classList.remove('hidden');
+    }
+    if (clearBtn) {
+      clearBtn.classList.add('hidden');
+    }
+  }
+
+  private setModalAuthMode(mode: 'password' | 'key' | 'none' | 'cf_ca'): void {
+    if (mode === 'cf_ca' && !this.cfSshCaEnabled) return;
+    this.modalAuthMode = mode;
+    for (const value of ['password', 'key', 'none', 'cf_ca'] as const) {
+      const tabId = value === 'cf_ca' ? 'modal-auth-tab-cf-ca' : `modal-auth-tab-${value}`;
+      const sectionId = value === 'cf_ca' ? 'modal-cf-ca-section' : `modal-${value}-section`;
+      const tab = document.getElementById(tabId);
+      const section = document.getElementById(sectionId);
+      tab?.classList.toggle('auth-tab-active', mode === value);
+      tab?.setAttribute('aria-pressed', String(mode === value));
+      if (section) section.style.display = mode === value ? '' : 'none';
+    }
+    const editingPassword =
+      mode === 'password' &&
+      this.editingServerId !== null &&
+      this.editingOriginalAuthMethod === 'password';
+    const emptyPassword = document.getElementById('server-empty-password') as HTMLInputElement;
+    document.getElementById('server-empty-password-option')!
+      .classList.toggle('hidden', !editingPassword);
+    (document.getElementById('server-password') as HTMLInputElement).disabled =
+      editingPassword && emptyPassword.checked;
+    const hint = document.getElementById('server-password-hint')!;
+    const hintKey = editingPassword ? 'server.passwordEditHint' : 'auth.passwordHint';
+    hint.dataset.i18n = hintKey;
+    hint.textContent = t(hintKey);
   }
 
   private getJumpPath(server: ServerConfig): string[] {
@@ -753,12 +1139,18 @@ export class ServerList {
     const byId = new Map(this.servers.map((item) => [item.id, item]));
     for (const candidate of this.servers) {
       if (candidate.id === this.editingServerId) continue;
+      if (candidate.transport_type === 'cf_tunnel') continue;
+      if (candidate.cf_ssh_ca_team) continue;
       const seen = new Set<number>();
       let current: ServerConfig | undefined = candidate;
       let depth = 0;
       let invalid = false;
       while (current) {
-        if (seen.has(current.id) || current.id === this.editingServerId) {
+        if (
+          seen.has(current.id) ||
+          current.id === this.editingServerId ||
+          current.cf_ssh_ca_team
+        ) {
           invalid = true;
           break;
         }
@@ -785,6 +1177,17 @@ export class ServerList {
     const inferredInfo = document.getElementById('server-region-inferred');
     if (!jumpSelect || !regionSelect || !inferredInfo) return;
 
+    const isTunnel = this.modalTransportMode === 'cf_tunnel';
+    if (isTunnel) {
+      regionSelect.disabled = false;
+      regionSelect.classList.remove('cursor-not-allowed', 'opacity-60');
+      inferredInfo.textContent = '';
+      inferredInfo.classList.add('hidden');
+      return;
+    }
+
+    inferredInfo.classList.remove('hidden');
+
     const usesJumpHost = jumpSelect.value !== '';
     regionSelect.disabled = usesJumpHost;
     regionSelect.classList.toggle('cursor-not-allowed', usesJumpHost);
@@ -803,10 +1206,16 @@ export class ServerList {
   }
 
   private async handleSubmit(): Promise<void> {
+    const generation = this.modalGeneration;
+    const editingServerId = this.editingServerId;
+    if ((document.getElementById('server-submit-btn') as HTMLButtonElement).disabled) return;
     const name = (document.getElementById('server-name') as HTMLInputElement).value.trim();
     const host = (document.getElementById('server-host') as HTMLInputElement).value.trim();
     const portInput = document.getElementById('server-port') as HTMLInputElement;
-    const port = parsePort(portInput.value);
+    const isTunnel = this.modalTransportMode === 'cf_tunnel';
+    // 隧道连接只看域名：端口仅为存储记录，隐藏字段缺省（如先在直连模式清空再切隧道）时回落 22
+    let port = parsePort(portInput.value);
+    if (isTunnel && port === null) port = 22;
     const username = (document.getElementById('server-username') as HTMLInputElement).value.trim();
     const password = (document.getElementById('server-password') as HTMLInputElement).value;
     const privateKey = (document.getElementById('server-private-key') as HTMLTextAreaElement).value;
@@ -822,7 +1231,14 @@ export class ServerList {
         title: t('server.detailsTitle'),
         variant: 'warning',
       });
-      const missingId = name ? (host ? 'server-username' : 'server-host') : 'server-name';
+      let missingId = 'server-name';
+      if (name) {
+        if (host) {
+          missingId = 'server-username';
+        } else {
+          missingId = 'server-host';
+        }
+      }
       (document.getElementById(missingId) as HTMLInputElement)?.focus();
       return;
     }
@@ -836,27 +1252,71 @@ export class ServerList {
       return;
     }
 
-    const authMethod = this.modalAuthMode === 'key' ? 'publickey' : 'password';
-    const credential = authMethod === 'publickey' ? privateKey : password;
+    const isCfCa = this.modalAuthMode === 'cf_ca';
+    let cfSshCaTeam: string | null = null;
+    if (isCfCa) {
+      const teamInput = document.getElementById('server-cf-ca-team') as HTMLInputElement | null;
+      cfSshCaTeam = teamInput?.value.trim() || '';
+      if (!cfSshCaTeam) {
+        notify(t('auth.cfTeamRequired'), {
+          title: t('server.detailsTitle'),
+          variant: 'warning',
+        });
+        teamInput?.focus();
+        return;
+      }
+    }
+
+    const authMethod =
+      this.modalAuthMode === 'key' || this.modalAuthMode === 'cf_ca'
+        ? 'publickey'
+        : this.modalAuthMode;
+    const useEmptyPassword =
+      authMethod === 'password' &&
+      (document.getElementById('server-empty-password') as HTMLInputElement).checked;
+    let credential =
+      authMethod === 'none' || useEmptyPassword || isCfCa
+        ? ''
+        : authMethod === 'publickey' ? privateKey : password;
     const authMethodChanged =
       this.editingServerId !== null &&
       this.editingOriginalAuthMethod !== null &&
       authMethod !== this.editingOriginalAuthMethod;
 
-    // 新增或切换认证方式时必须填写与新方式匹配的凭据
-    if ((!this.editingServerId || authMethodChanged) && !credential) {
+    // 只有非 CF CA 的常规私钥模式必须非空；编辑已有密码时留空仍保留原值，除非明确勾选设为空密码。
+    if (
+      authMethod === 'publickey' &&
+      !isCfCa &&
+      (!this.editingServerId || authMethodChanged) &&
+      !credential
+    ) {
       notify(
         authMethodChanged
           ? t('server.credentialRequiredAfterAuthChange')
-          : t(authMethod === 'publickey' ? 'auth.validationPrivateKey' : 'auth.validationPassword'),
+          : t('auth.validationPrivateKey'),
         {
           title: t('auth.incompleteCredentials'),
           variant: 'warning',
         }
       );
-      const credentialId = authMethod === 'publickey' ? 'server-private-key' : 'server-password';
-      (document.getElementById(credentialId) as HTMLInputElement | HTMLTextAreaElement)?.focus();
+      (document.getElementById('server-private-key') as HTMLTextAreaElement)?.focus();
       return;
+    }
+
+    let cleanTunnelHost: string | null = null;
+    if (isTunnel) {
+      cleanTunnelHost = host
+        .replace(/^(https?|wss?):\/\//i, '')
+        .replace(/\/.*$/, '')
+        .replace(/:\d+$/, '');
+      if (!isValidTunnelHostname(cleanTunnelHost)) {
+        notify(t('server.invalidTunnelHost'), {
+          title: t('server.detailsTitle'),
+          variant: 'warning',
+        });
+        document.getElementById('server-host')?.focus();
+        return;
+      }
     }
 
     const submitBtn = document.getElementById('server-submit-btn') as HTMLButtonElement;
@@ -868,6 +1328,15 @@ export class ServerList {
     `;
 
     try {
+      if (authMethod === 'publickey' && credential) {
+        const prepared = await preparePrivateKey(credential, true);
+        if (!prepared || generation !== this.modalGeneration || this.modalAuthMode !== 'key' ||
+            (document.getElementById('server-host') as HTMLInputElement).value.trim() !== host ||
+            (document.getElementById('server-username') as HTMLInputElement).value.trim() !== username ||
+            (document.getElementById('server-private-key') as HTMLTextAreaElement).value !== privateKey ||
+            (this.modalTransportMode === 'cf_tunnel') !== isTunnel) return;
+        credential = prepared.key;
+      }
       const body: ServerSavePayload = {
         name,
         host,
@@ -875,38 +1344,65 @@ export class ServerList {
         username,
         auth_method: authMethod,
         tags,
-        jump_server_id: jumpServerId,
+        transport_type: this.modalTransportMode,
+        jump_server_id: isTunnel ? null : jumpServerId,
       };
-      if (credential) body.credential = credential;
+      const preserveHiddenCfCa =
+        !this.cfSshCaEnabled &&
+        Boolean(this.editingOriginalCfTeam) &&
+        authMethod === 'publickey' &&
+        !authMethodChanged;
+      if (!preserveHiddenCfCa) {
+        body.cf_ssh_ca_team = isCfCa ? cfSshCaTeam : null;
+      }
+      if (
+        credential ||
+        (authMethod === 'password' && (!this.editingServerId || authMethodChanged || useEmptyPassword))
+      ) {
+        body.credential = credential;
+      }
 
-      // 只有 Cloudflare 直连入口才提交区域偏好；下游节点由跳板链入口决定。
+      if (isTunnel && cleanTunnelHost) {
+        body.cf_tunnel_host = cleanTunnelHost;
+        const clientId = (
+          document.getElementById('server-cf-client-id') as HTMLInputElement | null
+        )?.value.trim();
+        const clientSecret = (
+          document.getElementById('server-cf-client-secret') as HTMLInputElement | null
+        )?.value.trim();
+        if (clientId !== undefined) body.cf_access_client_id = clientId;
+        if (clientSecret) {
+          body.cf_access_client_secret = clientSecret;
+        } else if (this.clearCfAccessClientSecret) {
+          body.cf_access_client_secret = '';
+        }
+      }
+
+      // 直连入口或 Cloudflare 隧道入口均可提交手动区域偏好以优化调度
       const regionSelect = document.getElementById('server-region') as HTMLSelectElement | null;
-      if (regionSelect && jumpServerId === null) {
+      if (regionSelect && (isTunnel || jumpServerId === null)) {
         body.region = regionSelect.value || '';
       }
 
       // 保存请求（后端在保存时会同步推断 locationHint，故时间可能略长）
       let res: Response;
-      if (this.editingServerId) {
-        res = await fetch(`/api/servers/${this.editingServerId}`, {
+      if (editingServerId) {
+        res = await fetch(`/api/servers/${editingServerId}`, {
           method: 'PUT',
+          redirect: 'manual',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
       } else {
         res = await fetch('/api/servers', {
           method: 'POST',
+          redirect: 'manual',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
       }
 
-      if (!res.ok) {
-        const err = (await res.json()) as { error?: string };
-        throw new Error(err.error || 'Save failed');
-      }
-
-      const responseData = (await res.json()) as ServerSaveResponse;
+      const responseData = await readApiJson<ServerSaveResponse>(res, 'api.requestFailed');
       const debugLines = Array.isArray(responseData._debug)
         ? responseData._debug.filter((line): line is string => typeof line === 'string')
         : null;
@@ -921,7 +1417,16 @@ export class ServerList {
       // 非调试模式：用简短 toast 提示推断结果，让用户知道区域调度已生效
       // POST 与 PUT 路径后端均会返回最新记录（含 inferred_hint 字段）
       if (!debugLines) {
-        if (jumpServerId === null) {
+        if (isTunnel) {
+          const userRegion = body.region || null;
+          if (userRegion) {
+            notify(t('server.savedRegion', { region: regionLabel(userRegion) }), {
+              variant: 'success',
+            });
+          } else {
+            notify(t('server.savedTunnel'), { variant: 'success' });
+          }
+        } else if (jumpServerId === null) {
           const inferred = responseData.inferred_hint || null;
           const userRegion = body.region || null;
           if (userRegion || inferred) {
@@ -948,12 +1453,15 @@ export class ServerList {
         variant: 'danger',
       });
     } finally {
-      submitBtn.disabled = false;
-    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
-      submitBtn.innerHTML = `
-        <span class="material-symbols-outlined" style="font-size: 18px;">save</span>
-        ${this.editingServerId ? t('server.update') : t('server.save')}
-      `;
+      // An old unlock/save must never mutate a subsequently opened editor's controls.
+      if (generation === this.modalGeneration) {
+        submitBtn.disabled = false;
+        // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+        submitBtn.innerHTML = `
+          <span class="material-symbols-outlined" style="font-size: 18px;">save</span>
+          ${this.editingServerId ? t('server.update') : t('server.save')}
+        `;
+      }
     }
   }
 
@@ -1002,7 +1510,12 @@ export class ServerList {
 
   private async logout(): Promise<void> {
     try {
-      await fetch('/api/auth/logout', { method: 'POST' });
+      const res = await fetch('/api/auth/logout', { method: 'POST' });
+      const data = (await res.json().catch(() => ({}))) as { logoutUrl?: string };
+      if (data?.logoutUrl === '/cdn-cgi/access/logout') {
+        window.location.href = '/cdn-cgi/access/logout';
+        return;
+      }
     } catch {
       // 即使请求失败也清除本地状态
     }

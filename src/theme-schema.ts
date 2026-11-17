@@ -1,15 +1,38 @@
-export const THEME_SCHEMA_VERSION = 3;
+export const THEME_SCHEMA_VERSION = 4;
 export const THEME_MAX_BYTES = 64 * 1024;
+export const MAX_CUSTOM_THEMES = 20;
+
+export interface UserCustomThemeItem {
+  id: string;
+  name: string;
+  data: NormalizedThemeData;
+  createdAt: number;
+}
+
+export interface UserThemePayload {
+  themes: UserCustomThemeItem[];
+  activeId: string | null;
+}
+
 
 export const BUILT_IN_THEME_NAMES = [
   'standard-dark',
   'standard-light',
   'cyberpunk',
-  'apple',
-  'gruvbox',
-  'crt',
-  'glass',
+  'liquid-glass',
 ] as const;
+
+/**
+ * 已下线的内置主题到当前有效内置主题的平滑映射。
+ * 保证历史自定义主题导入或加载时，仍能继承最契合的调色板基底。
+ * 未在此映射表中的未知主题名（如更早期的 glacier）则按规范丢弃 baseTheme，由明暗方案兜底。
+ */
+export const LEGACY_BASE_THEME_MAP: Record<string, BuiltInThemeName> = {
+  apple: 'liquid-glass',
+  gruvbox: 'standard-dark',
+  crt: 'cyberpunk',
+  glass: 'liquid-glass',
+};
 
 export const SAFE_UI_THEME_PROPERTIES = [
   '--bg',
@@ -67,7 +90,7 @@ export const SAFE_TERMINAL_THEME_PROPERTIES = [
   'brightWhite',
 ] as const;
 
-const UI_STYLE_NAMES = ['standard', 'cyberpunk', 'soft', 'dense'] as const;
+const UI_STYLE_NAMES = ['standard', 'cyberpunk', 'soft', 'dense', 'liquid'] as const;
 const THEME_SHAPES = ['square', 'rounded', 'soft'] as const;
 const THEME_DENSITIES = ['compact', 'comfortable', 'spacious'] as const;
 const THEME_FONTS = ['mono', 'system'] as const;
@@ -189,8 +212,10 @@ export function normalizeThemeData(data: unknown): NormalizedThemeData | null {
   }
 
   const baseTheme =
-    typeof input.baseTheme === 'string' && BUILT_IN_THEME_SET.has(input.baseTheme)
-      ? (input.baseTheme as BuiltInThemeName)
+    typeof input.baseTheme === 'string'
+      ? BUILT_IN_THEME_SET.has(input.baseTheme)
+        ? (input.baseTheme as BuiltInThemeName)
+        : LEGACY_BASE_THEME_MAP[input.baseTheme]
       : undefined;
   const name = typeof input.name === 'string' ? input.name.trim().slice(0, 80) : '';
 
@@ -331,3 +356,79 @@ function inferColorScheme(background: string | undefined): ColorScheme {
     .reduce((sum, value, index) => sum + value * [0.2126, 0.7152, 0.0722][index], 0);
   return luminance > 0.5 ? 'light' : 'dark';
 }
+
+export function normalizeUserThemePayload(data: unknown): UserThemePayload | null {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+  const input = data as Record<string, unknown>;
+
+  // 1. 如果包含 themes 数组
+  if (Array.isArray(input.themes)) {
+    const validThemes: UserCustomThemeItem[] = [];
+    const seenIds = new Set<string>();
+
+    for (const item of input.themes) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+      const rawItem = item as Record<string, unknown>;
+      const rawId = typeof rawItem.id === 'string' ? rawItem.id.trim() : '';
+      if (!rawId || rawId.length > 64 || seenIds.has(rawId)) continue;
+
+      const themeData = normalizeThemeData(rawItem.data);
+      if (!themeData) continue;
+
+      const rawName = typeof rawItem.name === 'string' ? rawItem.name.trim() : '';
+      const name = rawName.slice(0, 80) || themeData.name || 'Custom Theme';
+      const createdAt =
+        typeof rawItem.createdAt === 'number' && Number.isFinite(rawItem.createdAt)
+          ? rawItem.createdAt
+          : Date.now();
+
+      seenIds.add(rawId);
+      validThemes.push({
+        id: rawId,
+        name,
+        data: themeData,
+        createdAt,
+      });
+
+      if (validThemes.length >= MAX_CUSTOM_THEMES) break;
+    }
+
+    const rawActiveId =
+      typeof input.activeId === 'string'
+        ? input.activeId.trim()
+        : typeof input.active_id === 'string'
+          ? input.active_id.trim()
+          : null;
+    const activeId =
+      rawActiveId && seenIds.has(rawActiveId)
+        ? rawActiveId
+        : validThemes.length > 0
+          ? validThemes[0].id
+          : null;
+
+    return {
+      themes: validThemes,
+      activeId,
+    };
+  }
+
+  // 2. 如果是旧的单主题对象（直接包含 ui, appearance 等属性）
+  const singleTheme = normalizeThemeData(data);
+  if (singleTheme) {
+    const singleId = 'default';
+    return {
+      themes: [
+        {
+          id: singleId,
+          name: singleTheme.name || 'Custom Theme',
+          data: singleTheme,
+          createdAt: Date.now(),
+        },
+      ],
+      activeId: singleId,
+    };
+  }
+
+  return null;
+}
+

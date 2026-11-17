@@ -1,5 +1,6 @@
 import { type TranslationKey, type TranslationParams, t } from './i18n';
 
+// SSH 协议状态事件到 i18n 词条的静态映射表
 const SSH_EVENT_KEYS: Record<string, TranslationKey> = {
   jump_hop_connecting: 'terminal.status.jumpHopConnecting',
   jump_target_connecting: 'terminal.status.jumpTargetConnecting',
@@ -21,16 +22,22 @@ const SSH_EVENT_KEYS: Record<string, TranslationKey> = {
   auth_protocol_error: 'terminal.status.authProtocolError',
   auth_success: 'terminal.status.authSuccess',
   auth_failed: 'terminal.status.authFailed',
+  auth_none_rejected: 'terminal.status.authNoneRejected',
   shell_ready: 'terminal.status.shellReady',
   session_ended: 'terminal.status.sessionEnded',
   remote_closed: 'terminal.status.remoteClosed',
   keepalive_timeout: 'terminal.status.keepaliveTimeout',
   idle_timeout: 'terminal.status.idleTimeout',
+  session_idle_timeout: 'terminal.status.sessionIdleTimeout',
+  session_idle_warning: 'terminal.status.sessionIdleWarning',
   input_backlog_closed: 'terminal.status.inputBacklogClosed',
+  output_backlog_closed: 'terminal.status.outputBacklogClosed',
   packet_error: 'terminal.status.packetError',
   algorithm_error: 'terminal.status.algorithmError',
   service_error: 'terminal.status.serviceError',
   host_key_accepted: 'terminal.status.hostKeyAccepted',
+  host_key_invalid: 'terminal.status.hostKeyInvalid',
+  host_key_certificate_tofu: 'terminal.status.hostKeyCertificateTofu',
   host_key_fingerprint_matched_unverified: 'terminal.status.hostKeyFingerprintMatchedUnverified',
   host_key_first_seen: 'terminal.status.hostKeyFirstSeen',
   host_key_not_saved: 'terminal.status.hostKeyNotSaved',

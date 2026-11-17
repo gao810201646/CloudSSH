@@ -4,7 +4,7 @@ import { maskIPAddress } from './host-display';
 import { t } from './i18n';
 import { getNetworkQuality } from './network-quality';
 import { SFTPPanel } from './sftp-panel';
-import { SSHTerminal, type TerminalSelectionAnchor } from './terminal';
+import { SSHTerminal, type SSHHostInfo, type TerminalSelectionAnchor } from './terminal';
 import { notify } from './ui-feedback';
 
 export type TabState = 'connecting' | 'connected' | 'disconnected';
@@ -16,7 +16,7 @@ export interface TabInfo {
   sftpPanel: SFTPPanel | null;
   agentPanel: AgentPanel | null;
   containerEl: HTMLElement;
-  hostInfo?: { host: string; port: number; username?: string; serverId?: number };
+  hostInfo?: SSHHostInfo;
   state: TabState;
   cfLatency?: number;
   cfColo?: string;
@@ -37,10 +37,18 @@ export class TabManager {
   private tabBarEl: HTMLElement;
   private terminalAreaEl: HTMLElement;
   private tabCounter = 0;
-  private _isLoggedIn: boolean = false;
+  private githubId: number | null = null;
 
   /** 标签右键菜单的 document click 监听器（关闭菜单时统一移除，防止累积） */
   private tabCtxCloseHandler: ((e: MouseEvent) => void) | null = null;
+
+  /** 上次渲染的标签 id 集合与活跃 id：入场/激活动画只挂给"新出现"的标签，
+      避免 renderTabBar 全量重建导致状态刷新反复重放动画 */
+  private lastRenderedTabIds: Set<string> = new Set();
+  private lastRenderedActiveId: string | null = null;
+
+  /** 关闭动画进行期间抑制重排：动画结束后由 finish 回调统一补一次渲染 */
+  private renderSuppressed = false;
 
   /** 当所有标签都被关闭时触发，外部可以用它来回到连接页面 */
   private onAllTabsClosed?: () => void;
@@ -59,8 +67,12 @@ export class TabManager {
     this.terminalAreaEl = document.getElementById(terminalAreaId)!;
   }
 
-  setLoggedIn(loggedIn: boolean): void {
-    this._isLoggedIn = loggedIn;
+  setUser(githubId: number | null): void {
+    if (this.githubId !== githubId) {
+      this.githubId = githubId;
+      // A delayed shell_ready from an old account must not acquire the new identity.
+      if (this.tabs.size > 0) this.closeAllTabs();
+    }
     this.updateSelectionAction();
   }
 
@@ -84,7 +96,7 @@ export class TabManager {
 
   createTab(
     label: string,
-    hostInfo?: { host: string; port: number; username?: string; serverId?: number }
+    hostInfo?: SSHHostInfo
   ): TabInfo {
     const id = `tab-${++this.tabCounter}-${Date.now()}`;
 
@@ -119,10 +131,13 @@ export class TabManager {
           tab.sftpPanel.dispose();
           tab.sftpPanel = null;
         }
-        // 清理该标签的 Agent 面板
+        // A transport interruption must not destroy the surviving Agent task UI.
         if (tab.agentPanel) {
-          tab.agentPanel.dispose();
-          tab.agentPanel = null;
+          if (willReconnect) tab.agentPanel.suspendConnection();
+          else {
+            tab.agentPanel.dispose();
+            tab.agentPanel = null;
+          }
         }
         tab.selectedText = '';
         tab.selectionAnchor = null;
@@ -131,9 +146,16 @@ export class TabManager {
     });
 
     // 设置 SSH 就绪回调：初始化 SFTP 面板 + Agent 面板
-    terminal.setSessionReadyHandler(() => {
+    terminal.setSessionReadyHandler((resumed = false) => {
       const tab = this.tabs.get(id);
       if (tab) {
+        if (!resumed && tab.agentPanel) {
+          if (tab.agentPanel.hasActiveTask()) {
+            notify(t('agent.previousSessionEnded'), { variant: 'warning' });
+          }
+          tab.agentPanel.dispose();
+          tab.agentPanel = null;
+        }
         tab.state = 'connected';
         this.renderTabBar();
         if (this.activeTabId === id) {
@@ -148,8 +170,10 @@ export class TabManager {
         tab.sftpPanel.handleSSHReady();
 
         // 初始化 Agent 面板（仅登录用户）
-        if (this._isLoggedIn && !tab.agentPanel) {
-          tab.agentPanel = new AgentPanel(tab.containerEl, true);
+        if (this.githubId !== null && !tab.agentPanel) {
+          tab.agentPanel = new AgentPanel(
+            document.body, true, tab.hostInfo?.serverId, this.githubId
+          );
           tab.agentPanel.render();
           tab.agentPanel.setWebSocketSend((data: string) =>
             tab.terminal.sendWebSocketMessage(data)
@@ -168,10 +192,15 @@ export class TabManager {
           tab.terminal.setAgentFrameHandler((msg: any) => {
             tab.agentPanel?.handleAgentFrame(msg);
           });
+          // 互斥联动：Agent 打开前自动收起 SFTP 面板
+          tab.agentPanel.setBeforeShowHandler(() => {
+            tab.sftpPanel?.hide();
+          });
           // AgentPanel 展开/收起时触发终端重新适配尺寸
           tab.agentPanel.setLayoutChangeHandler(() => tab.terminal.fit());
           this.updateSelectionAction(tab);
         }
+        if (resumed) tab.agentPanel?.resumeConnection();
       }
     });
 
@@ -230,11 +259,12 @@ export class TabManager {
     if (!tab) return;
     if (this.activeTabId === tabId) return;
 
-    // 隐藏当前活跃标签的 SFTP 面板
+    // 隐藏当前活跃标签的 SFTP 面板与 Agent 面板
     if (this.activeTabId && this.activeTabId !== tabId) {
       const prevTab = this.tabs.get(this.activeTabId);
       if (prevTab) {
         prevTab.agentPanel?.rejectPendingConfirmation(false);
+        prevTab.agentPanel?.hide();
         prevTab.containerEl.style.display = 'none';
         prevTab.sftpPanel?.hide();
       }
@@ -260,6 +290,23 @@ export class TabManager {
   closeTab(tabId: string): void {
     const tab = this.tabs.get(tabId);
     if (!tab) return;
+
+    // 退出动画：挂类并抑制重排，动画结束（或兜底超时）后统一补一次渲染。
+    // 状态清理照旧同步执行，动画只是标签栏视觉层的延迟移除。
+    const tabEl = this.tabBarEl.querySelector(`[data-tab-id="${tabId}"]`);
+    const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
+    if (tabEl && !reduceMotion) {
+      tabEl.classList.add('tab-item--exit');
+      this.renderSuppressed = true;
+      const finish = () => {
+        if (!this.renderSuppressed) return;
+        this.renderSuppressed = false;
+        this.renderTabBar();
+      };
+      tabEl.addEventListener('animationend', finish, { once: true });
+      // 兜底：motion=none 动画时长归零或动画被禁用时 animationend 可能不触发
+      setTimeout(finish, 260);
+    }
 
     // 清理资源
     if (tab.sftpPanel) {
@@ -333,6 +380,16 @@ export class TabManager {
     return this.tabs.size > 0;
   }
 
+  /** 收起所有标签页的侧边抽屉（SFTP 面板与 AI Agent 面板） */
+  closeAllDrawers(): void {
+    for (const tab of this.tabs.values()) {
+      tab.agentPanel?.rejectPendingConfirmation(false);
+      tab.agentPanel?.hide();
+      tab.sftpPanel?.hide();
+    }
+    document.body.classList.remove('agent-panel-open');
+  }
+
   private getTerminalTargetLabel(tab: TabInfo): string {
     if (!tab.hostInfo) return tab.label;
     const userPrefix = tab.hostInfo.username ? `${tab.hostInfo.username}@` : '';
@@ -378,6 +435,7 @@ export class TabManager {
     const selection = tab?.selectedText || '';
     if (!tab?.agentPanel || !selection.trim()) return false;
 
+    tab.sftpPanel?.hide();
     const attached = tab.agentPanel.attachTerminalSelection(
       selection,
       this.getTerminalTargetLabel(tab)
@@ -391,13 +449,18 @@ export class TabManager {
   // ==================== 渲染标签栏 ====================
 
   renderTabBar(): void {
+    if (this.renderSuppressed) return;
     // 保留 new-tab-btn，清除其他标签按钮
     const newTabBtn = this.tabBarEl.querySelector('#new-tab-btn');
     this.tabBarEl.replaceChildren();
 
+    const renderedIds = new Set<string>();
     for (const tab of this.tabs.values()) {
+      renderedIds.add(tab.id);
       const tabEl = document.createElement('div');
-      tabEl.className = `tab-item${tab.id === this.activeTabId ? ' active' : ''}${tab.state === 'disconnected' ? ' disconnected' : ''}`;
+      const isNew = !this.lastRenderedTabIds.has(tab.id);
+      const isNewlyActive = tab.id === this.activeTabId && this.activeTabId !== this.lastRenderedActiveId;
+      tabEl.className = `tab-item${tab.id === this.activeTabId ? ' active' : ''}${tab.state === 'disconnected' ? ' disconnected' : ''}${isNew ? ' tab-item--enter' : ''}${isNewlyActive ? ' tab-item--activate' : ''}`;
       tabEl.dataset.tabId = tab.id;
 
       // 状态指示点
@@ -453,6 +516,9 @@ export class TabManager {
       btn.appendChild(this.createIcon('add', '16px'));
       this.tabBarEl.appendChild(btn);
     }
+
+    this.lastRenderedTabIds = renderedIds;
+    this.lastRenderedActiveId = this.activeTabId;
   }
 
   private tabDotClass(state: TabState): string {
@@ -491,7 +557,16 @@ export class TabManager {
       this.renameTab(tab.id, input.value);
     };
 
+    let isComposing = false;
+    input.addEventListener('compositionstart', () => {
+      isComposing = true;
+    });
+    input.addEventListener('compositionend', () => {
+      isComposing = false;
+    });
+
     input.addEventListener('keydown', (e) => {
+      if (e.isComposing || isComposing || e.keyCode === 229) return;
       if (e.key === 'Enter') {
         e.preventDefault();
         commit();
@@ -726,7 +801,7 @@ export class TabManager {
     const button = document.getElementById('ask-ai-selection-btn');
     if (!button) return;
     const visible = !!(
-      this._isLoggedIn &&
+      this.githubId !== null &&
       tab &&
       tab.id === this.activeTabId &&
       tab.state === 'connected' &&

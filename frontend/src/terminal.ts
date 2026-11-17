@@ -20,12 +20,14 @@ import {
   applyMobileModifier,
   diffTextareaInput,
   isIOSLike,
+  isTerminalFocusReport,
   type MobileModifier,
   type MobileTerminalKey,
   mobileTerminalKeySequence,
 } from './mobile-input';
 import { currentTerminalFontSize } from './terminal-layout';
 import { localizedSSHMessage } from './terminal-status';
+import { TerminalOutputAck } from './terminal-output-ack';
 import { centerTerminalText } from './terminal-text';
 import { getActiveTerminalTheme, onTerminalThemeChange } from './theme';
 import { confirmAction, notify } from './ui-feedback';
@@ -33,6 +35,7 @@ import { confirmAction, notify } from './ui-feedback';
 const TRZSZ_MAX_DATA_CHUNK_SIZE = 2 * 1024 * 1024;
 const NON_RETRIABLE_AUTH_EVENTS = new Set([
   'auth_failed',
+  'auth_none_rejected',
   'auth_interactive_protocol_error',
   'auth_interactive_limit',
   'auth_interactive_client_unavailable',
@@ -41,6 +44,11 @@ const NON_RETRIABLE_AUTH_EVENTS = new Set([
   'auth_interactive_failed',
   'auth_password_change_required',
   'auth_protocol_error',
+  'session_idle_timeout',
+  'output_backlog_closed',
+  'packet_error',
+  'algorithm_error',
+  'host_key_invalid',
 ]);
 const RTT_HEARTBEAT_INTERVAL_MS = 5000;
 const HEARTBEAT_RESPONSE_TIMEOUT_MS = 10_000;
@@ -51,6 +59,8 @@ export interface SSHHostInfo {
   username?: string;
   /** 登录用户保存的服务器 ID，用于断线后重新申请一次性连接令牌。 */
   serverId?: number;
+  /** Cloudflare Zero Trust SSH CA 团队标识（用于断线重连或克隆时重新签发短期证书） */
+  cfSshCaTeam?: string | null;
 }
 
 export type ReconnectWebSocketFactory = () => Promise<WebSocket>;
@@ -60,8 +70,9 @@ export interface SSHConnectionConfig {
   port: number;
   username: string;
   password?: string;
-  authMethod?: 'password' | 'publickey';
+  authMethod?: 'password' | 'publickey' | 'none';
   privateKey?: string;
+  certificate?: string;
   expectedFingerprint?: string;
   /** 匿名路径手动覆盖的区域偏好（保存服务器路径不使用此字段） */
   locationHint?: string;
@@ -115,6 +126,7 @@ interface TerminalCell {
 }
 
 interface MobileScrollGesture {
+  mode: 'local' | 'remote';
   pointerId: number;
   startX: number;
   startY: number;
@@ -124,6 +136,7 @@ interface MobileScrollGesture {
 }
 
 const MOBILE_SCROLL_START_THRESHOLD_PX = 10;
+const MAX_MOBILE_WHEEL_EVENTS_PER_MOVE = 16;
 const MOBILE_VIEWPORT_QUERY = '(max-width: 767px), (max-width: 1180px) and (pointer: coarse)';
 const MOBILE_CONNECTION_RECOVERY_QUERY = '(pointer: coarse)';
 
@@ -146,6 +159,7 @@ export class SSHTerminal {
   private terminalDisposables: { dispose(): void }[] = [];
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
   private trzszFilter: TrzszFilter | null = null;
+  private terminalOutputAck: TerminalOutputAck | null = null;
   private mounted: boolean = false;
   private reconnectAttempts: number = 0;
   private maxReconnectAttempts: number = 5;
@@ -157,7 +171,7 @@ export class SSHTerminal {
   private sessionReady: boolean = false;
   private restoreCursorBlinkAfterReturnPrompt: boolean = false;
   private onSessionClosed?: (event: CloseEvent, willReconnect: boolean) => void;
-  private onSessionReady?: () => void;
+  private onSessionReady?: (resumed?: boolean) => void;
   private onAgentFrameHandler?: (msg: any) => void;
   private onOSDetectedHandler?: (serverId: number, os: string) => void;
   private sftpAttachUrl: string | null = null;
@@ -183,11 +197,14 @@ export class SSHTerminal {
   private mobileSelectionPointerId: number | null = null;
   private mobileSelectionStart: TerminalCell | null = null;
   private mobileScrollGesture: MobileScrollGesture | null = null;
+  private dispatchingMobileWheel = false;
   private mobileModifier: MobileModifier | null = null;
   private imeTextarea: HTMLTextAreaElement | null = null;
   private imePendingBaseline: string | null = null;
   private imePendingHandled = false;
   private imeKeyupTimer: ReturnType<typeof setTimeout> | null = null;
+  private imeIsComposing = false;
+  private imeConfirmEnter = false;
   private viewportRestoreFrame: number | null = null;
   private readonly mobileConnectionRecoveryEnabled: boolean;
   private pendingHostKeyChangeSocket: WebSocket | null = null;
@@ -343,6 +360,17 @@ export class SSHTerminal {
 
     // Terminal shortcuts: Search (Ctrl+Shift+F / Cmd+F) & Clear Buffer (Cmd+K / Ctrl+Shift+K)
     this.terminal.attachCustomKeyEventHandler((e: KeyboardEvent) => {
+      if (e.key === 'Enter') {
+        // Bind suppression to this Enter cycle, not a time window: Safari may end
+        // composition before keypress/keyup. The next keydown is evaluated afresh.
+        if (e.type === 'keydown') {
+          this.imeConfirmEnter = this.imeIsComposing || e.isComposing || e.keyCode === 229;
+        }
+        const confirming = this.imeConfirmEnter || this.imeIsComposing || e.isComposing;
+        if (e.type === 'keyup') this.imeConfirmEnter = false;
+        // Leave browser default handling intact so the IME can commit the candidate.
+        if (confirming) return false;
+      }
       const action = matchTerminalShortcut(e);
       if (action === 'search') {
         if (e.type === 'keydown') {
@@ -398,7 +426,7 @@ export class SSHTerminal {
     this.onSessionClosed = handler;
   }
 
-  setSessionReadyHandler(handler: () => void): void {
+  setSessionReadyHandler(handler: (resumed?: boolean) => void): void {
     this.onSessionReady = handler;
   }
 
@@ -551,6 +579,12 @@ export class SSHTerminal {
     this.notifySelectionChanged();
   }
 
+  getMcpSession(): { session: string; serverId: number } | null {
+    if (this.resumeOnlyMode || !this.sessionReady || !this.activeSessionId || !this.lastHostInfo?.serverId ||
+      this.ws?.readyState !== WebSocket.OPEN) return null;
+    return { session: this.activeSessionId, serverId: this.lastHostInfo.serverId };
+  }
+
   getSFTPWebSocketUrl(): string | null {
     return this.sftpAttachUrl;
   }
@@ -605,18 +639,27 @@ export class SSHTerminal {
     this.mobileSelectionStart = null;
   }
 
+  private getMobileScrollMode(): MobileScrollGesture['mode'] | null {
+    const mouseMode = this.terminal.modes.mouseTrackingMode;
+    // X10 only reports button presses, not wheels. Never fall back to cursor keys here.
+    if (mouseMode === 'x10') return null;
+    if (mouseMode !== 'none') {
+      return this.sessionReady && this.ws?.readyState === WebSocket.OPEN && this.trzszFilter
+        ? 'remote'
+        : null;
+    }
+    return this.terminal.buffer.active.type === 'normal' ? 'local' : null;
+  }
+
   private beginMobileScroll(event: PointerEvent): void {
     if (event.pointerType === 'mouse' || this.mobileSelectionMode) return;
     const target = event.target;
     if (!(target instanceof Element) || !target.closest('.xterm-screen')) return;
-    // 备用屏幕和远端鼠标协议由远端应用控制，不能把滑动误当作本地历史滚动。
-    if (
-      this.terminal.buffer.active.type !== 'normal' ||
-      this.terminal.modes.mouseTrackingMode !== 'none'
-    )
-      return;
+    const mode = this.getMobileScrollMode();
+    if (!mode) return;
 
     this.mobileScrollGesture = {
+      mode,
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
@@ -629,6 +672,11 @@ export class SSHTerminal {
   private updateMobileScroll(event: PointerEvent): boolean {
     const gesture = this.mobileScrollGesture;
     if (!gesture || gesture.pointerId !== event.pointerId) return false;
+    // A mode/connection change must not turn an in-flight remote swipe into local scrolling.
+    if (gesture.mode !== this.getMobileScrollMode()) {
+      this.finishMobileScroll(event.pointerId);
+      return false;
+    }
 
     if (!gesture.active) {
       const distanceX = Math.abs(event.clientX - gesture.startX);
@@ -655,10 +703,43 @@ export class SSHTerminal {
     gesture.lastY = event.clientY;
     const lines = Math.trunc(gesture.remainder / cellHeight);
     if (lines !== 0) {
-      this.terminal.scrollLines(lines);
+      if (gesture.mode === 'remote') {
+        this.dispatchMobileScrollWheel(gesture, lines);
+      } else {
+        this.terminal.scrollLines(lines);
+      }
       gesture.remainder -= lines * cellHeight;
     }
     return true;
+  }
+
+  private dispatchMobileScrollWheel(gesture: MobileScrollGesture, lines: number): void {
+    const screen = this.container.querySelector<HTMLElement>('.xterm-screen');
+    if (!screen) return;
+    const rect = screen.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    // Anchor to the original tmux pane even when pointer capture drags outside the screen.
+    const clientX = Math.min(Math.max(gesture.startX, rect.left), rect.right - 0.01);
+    const clientY = Math.min(Math.max(gesture.startY, rect.top), rect.bottom - 0.01);
+    const count = Math.min(Math.abs(lines), MAX_MOBILE_WHEEL_EVENTS_PER_MOVE);
+    this.dispatchingMobileWheel = true;
+    try {
+      for (let index = 0; index < count; index++) {
+        // xterm negotiates SGR/legacy/pixel encoding and emits through onData/onBinary -> trzsz.
+        screen.dispatchEvent(
+          new WheelEvent('wheel', {
+            bubbles: true,
+            cancelable: true,
+            clientX,
+            clientY,
+            deltaMode: WheelEvent.DOM_DELTA_LINE,
+            deltaY: Math.sign(lines),
+          })
+        );
+      }
+    } finally {
+      this.dispatchingMobileWheel = false;
+    }
   }
 
   private finishMobileScroll(pointerId?: number): boolean {
@@ -696,7 +777,7 @@ export class SSHTerminal {
 
     this.terminal.open(this.container);
     this.mounted = true;
-    this.installIOSIMEFallback();
+    this.installIMEHandlers();
 
     // Load WebGL addon after terminal is opened
     try {
@@ -982,6 +1063,7 @@ export class SSHTerminal {
             password: config.password,
             authMethod: config.authMethod,
             privateKey: config.privateKey,
+            certificate: config.certificate,
             expectedFingerprint: config.expectedFingerprint,
             ...this.getTerminalSize(),
           })
@@ -1045,6 +1127,12 @@ export class SSHTerminal {
   private setupWebSocketHandlers(rejectFn?: (reason?: any) => void): void {
     if (!this.ws) return;
     const socket = this.ws;
+    this.terminalOutputAck?.dispose();
+    const outputAck = new TerminalOutputAck((frame) => {
+      if (socket !== this.ws || socket.readyState !== WebSocket.OPEN) return;
+      try { socket.send(frame); } catch { /* Socket closed between state check and send. */ }
+    });
+    this.terminalOutputAck = outputAck;
 
     // Trzsz file transfer support
     this.trzszFilter = new TrzszFilter({
@@ -1082,6 +1170,10 @@ export class SSHTerminal {
         }
 
         try {
+          if (msg.type === 'terminal_output_flow') {
+            outputAck.start(msg.id);
+            return;
+          }
           if (msg.type === 'auth_challenge') {
             this.handleAuthChallenge(socket, msg);
             return;
@@ -1122,7 +1214,7 @@ export class SSHTerminal {
                 'w-2 h-2 bg-[var(--color-primary)]',
                 t('terminal.connected')
               );
-            this.onSessionReady?.();
+            this.onSessionReady?.(true);
             this.startHeartbeat();
             return;
           }
@@ -1141,9 +1233,10 @@ export class SSHTerminal {
                 this.authChallengeDialog?.dismiss();
               }
               if (msg.event === 'shell_ready' || msg.message === 'Shell 已就绪') {
+                const wasReady = this.sessionReady;
                 this.sessionReady = true;
                 this.reconnectAttempts = 0;
-                this.onSessionReady?.();
+                if (!wasReady) this.onSessionReady?.(false);
               }
               break;
             case 'error':
@@ -1194,11 +1287,16 @@ export class SSHTerminal {
         }
       } else {
         this.trzszFilter!.processServerOutput(event.data);
+        // Receipt ACK only: preserves the trzsz pipeline and does not claim that
+        // xterm rendering/file writes have completed. Server bounds WS in-flight bytes.
+        const bytes = event.data instanceof Blob ? event.data.size : event.data.byteLength;
+        outputAck.receive(bytes);
       }
     };
 
     this.ws.onclose = (event) => {
       if (socket !== this.ws) return;
+      outputAck.dispose();
 
       this.authChallengeDialog?.dismiss();
       this.stopHeartbeat();
@@ -1244,10 +1342,12 @@ export class SSHTerminal {
     // User input goes through trzsz filter
     this.disposables.push(
       this.terminal.onData((data) => {
-        if (this.imePendingBaseline !== null && data) {
+        const focusReport = isTerminalFocusReport(data);
+        // DECSET 1004 / focus changes emit onData too, but are not observed IME text input.
+        if (this.imePendingBaseline !== null && data && !focusReport) {
           this.imePendingHandled = true;
         }
-        this.processTerminalInput(data);
+        this.processTerminalInput(data, focusReport ? 'focus-report' : 'keyboard');
       })
     );
 
@@ -1372,18 +1472,25 @@ export class SSHTerminal {
     return true;
   }
 
-  private processTerminalInput(data: string): void {
+  private processTerminalInput(
+    data: string,
+    source: 'keyboard' | 'focus-report' = 'keyboard'
+  ): void {
     if (!this.sessionReady || !this.trzszFilter) return;
-    const transformed = applyMobileModifier(data, this.mobileModifier);
+    // Focus/mouse reports must keep their encoding and not consume one-shot keyboard modifiers.
+    const transformed = applyMobileModifier(
+      data,
+      source === 'focus-report' || this.dispatchingMobileWheel ? null : this.mobileModifier
+    );
     if (transformed.consumed) this.setMobileModifier(null);
     this.trzszFilter.processTerminalInput(transformed.data);
   }
 
   /**
-   * xterm.js 6.0 尚未包含上游 keyCode=229 keyup 修复。这里只在 iOS-like
-   * 环境补发 xterm 未观察到的 textarea 差异；若 xterm 已产生 onData 则不重复发送。
+   * Track composition on all platforms for Enter handling. Only iOS-like devices
+   * need the xterm.js 6.0 keyCode=229 keyup fallback; onData stays authoritative.
    */
-  private installIOSIMEFallback(): void {
+  private installIMEHandlers(): void {
     if (this.imeTextarea) return;
     const textarea = this.container.querySelector<HTMLTextAreaElement>('.xterm-helper-textarea');
     if (!textarea) return;
@@ -1393,13 +1500,19 @@ export class SSHTerminal {
     textarea.setAttribute('autocomplete', 'off');
     textarea.setAttribute('autocorrect', 'off');
     textarea.spellcheck = false;
+    textarea.addEventListener('compositionstart', this.imeCompositionStartListener, true);
+    textarea.addEventListener('compositionend', this.imeCompositionEndListener, true);
+    textarea.addEventListener('blur', this.imeBlurListener, true);
     if (!isIOSLike(navigator)) return;
     textarea.addEventListener('keydown', this.imeKeydownListener, true);
     textarea.addEventListener('keyup', this.imeKeyupListener, true);
-    textarea.addEventListener('compositionstart', this.imeCompositionStartListener, true);
   }
 
   private readonly imeKeydownListener = (event: KeyboardEvent): void => {
+    if (this.imeIsComposing || event.isComposing) {
+      this.clearIMEPendingInput();
+      return;
+    }
     if (event.keyCode !== 229 || !this.imeTextarea) return;
     if (this.imePendingBaseline === null) {
       this.imePendingBaseline = this.imeTextarea.value;
@@ -1407,15 +1520,25 @@ export class SSHTerminal {
     }
   };
 
-  private readonly imeKeyupListener = (_event: KeyboardEvent): void => {
+  private readonly imeKeyupListener = (event: KeyboardEvent): void => {
     // iOS 中文输入法只保证 keydown 使用 229；对应 keyup 可能是空格的 32、
     // 标点的 0，或其他实际键码。只要存在待处理的 229 周期就应检查差异。
+    // 在拼音输入法组词（composition）过程中，不得将中间拼音补发为按键输入。
+    if (this.imeIsComposing || event.isComposing) {
+      this.clearIMEPendingInput();
+      return;
+    }
     if (this.imePendingBaseline === null) return;
     if (this.imeKeyupTimer !== null) clearTimeout(this.imeKeyupTimer);
     // 让 xterm 自己在 keyup 或先前的 0ms fallback 中优先消费输入。
     this.imeKeyupTimer = setTimeout(() => {
       this.imeKeyupTimer = null;
-      if (!this.imePendingHandled && this.imeTextarea && this.imePendingBaseline !== null) {
+      if (
+        !this.imeIsComposing &&
+        !this.imePendingHandled &&
+        this.imeTextarea &&
+        this.imePendingBaseline !== null
+      ) {
         const diff = diffTextareaInput(this.imePendingBaseline, this.imeTextarea.value);
         if (diff) this.sendInput(diff);
       }
@@ -1424,6 +1547,18 @@ export class SSHTerminal {
   };
 
   private readonly imeCompositionStartListener = (): void => {
+    this.imeIsComposing = true;
+    this.clearIMEPendingInput();
+  };
+
+  private readonly imeCompositionEndListener = (): void => {
+    this.imeIsComposing = false;
+    this.clearIMEPendingInput();
+  };
+
+  private readonly imeBlurListener = (): void => {
+    this.imeIsComposing = false;
+    this.imeConfirmEnter = false;
     this.clearIMEPendingInput();
   };
 
@@ -1600,9 +1735,12 @@ export class SSHTerminal {
 
   private resetActiveConnection(): void {
     this.authChallengeDialog?.dismiss();
+    this.finishMobileScroll();
     this.stopHeartbeat();
     this.clearReconnectTimeout();
     this.disposeConnectionDisposables();
+    this.terminalOutputAck?.dispose();
+    this.terminalOutputAck = null;
 
     const socket = this.ws;
     this.ws = null;
@@ -1860,6 +1998,12 @@ export class SSHTerminal {
       this.imeCompositionStartListener,
       true
     );
+    this.imeTextarea?.removeEventListener(
+      'compositionend',
+      this.imeCompositionEndListener,
+      true
+    );
+    this.imeTextarea?.removeEventListener('blur', this.imeBlurListener, true);
     this.clearIMEPendingInput();
     if (this.viewportRestoreFrame !== null) cancelAnimationFrame(this.viewportRestoreFrame);
     this.viewportRestoreFrame = null;

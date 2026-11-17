@@ -1,10 +1,15 @@
 // 渲染模板中的 innerHTML 站点均带 `pi-lens-ignore: no-inner-html` 内联抑制：
 // 动态值均经 escapeHtml 转义或来自可信 i18n 词条，无用户输入直插；
 // GitHub Actions 质量门禁不含该规则（AGENTS.md #27）。
+import type { AppConfig } from './app-bootstrap';
 import { onLocaleChange, t, translateDocument } from './i18n';
+import { openAdminHashGeneratorDialog } from './admin-hash-generator';
 import { loadKnownFingerprint } from './known-hosts';
 import { parsePort } from './port';
+import { preparePrivateKey } from './private-key-import';
+import { stretchAdminPassword } from './password-stretch';
 import { populateRegionSelect } from './regions';
+import { requestCloudflareSshCertificate } from './cf-ssh-ca';
 import type { TabManager } from './tab-manager';
 import { type ColorScheme, getActiveColorScheme, onColorSchemeChange } from './theme';
 import { notify } from './ui-feedback';
@@ -63,6 +68,8 @@ async function decryptCredentials(
 }
 
 export interface ConnectionFormOptions {
+  /** 首屏已经确认的运行时配置，禁止先渲染匿名表单再异步替换。 */
+  config: AppConfig;
   /** 获取 TabManager 实例 */
   getTabManager: () => TabManager;
 }
@@ -74,10 +81,13 @@ export class ConnectionForm {
   private turnstileWidgetId: string | null = null;
   private turnstileSitekey = '';
   private turnstileTheme: ColorScheme | null = null;
+  /** 密码模式下的浏览器预拉伸参数（/api/config 公开下发）；null = 非密码模式 */
+  private passwordAuthParams: { iterations: number; salt: string } | null = null;
+  private adminDialogTurnstileId: string | null = null;
 
   constructor(options: ConnectionFormOptions) {
     this.options = options;
-    this.render();
+    this.renderConfiguredForm(options.config);
     onColorSchemeChange((colorScheme) => {
       if (
         this.turnstileEnabled &&
@@ -88,8 +98,6 @@ export class ConnectionForm {
         this.renderTurnstile();
       }
     });
-    this.loadSavedCredentials();
-    this.checkTurnstileConfig();
     onLocaleChange(() => {
       const select = document.getElementById('anon-region') as HTMLSelectElement | null;
       if (select) populateRegionSelect(select, select.value);
@@ -97,31 +105,56 @@ export class ConnectionForm {
     });
   }
 
-  private async checkTurnstileConfig(): Promise<void> {
-    try {
-      const response = await fetch('/api/config');
-      const config = (await response.json()) as {
-        turnstileEnabled: boolean;
-        sitekey: string;
-        githubAuthEnabled: boolean;
-        githubAuthRequired: boolean;
-      };
-      this.turnstileEnabled = config.turnstileEnabled;
-      this.turnstileSitekey = config.sitekey;
-      if (config.githubAuthRequired) {
-        this.renderGitHubAuthRequired(config.githubAuthEnabled);
+  private renderConfiguredForm(config: AppConfig): void {
+    this.turnstileEnabled = config.turnstileEnabled;
+    this.turnstileSitekey = config.sitekey || '';
+    this.cfSshCaEnabled = config.authMode === 'cf_access';
+
+    // Select the final panel before creating any credential inputs or reading local history.
+    if (config.authMode === 'password') {
+      if (config.passwordHashInvalid || !config.passwordAuth) {
+        this.renderAdminHashInvalid();
         return;
       }
-      if (this.turnstileEnabled && this.turnstileSitekey) {
-        this.renderTurnstile();
+      this.passwordAuthParams = {
+        iterations: config.passwordAuth.iterations,
+        salt: config.passwordAuth.salt,
+      };
+      if (config.githubAuthRequired) {
+        this.renderAdminAuthRequired();
+        return;
       }
-      // 渲染 GitHub 登录按钮（仅当 OAuth 已配置时）
-      if (config.githubAuthEnabled) {
-        this.renderGitHubLoginButton();
-      }
-    } catch {
-      // Config endpoint not available, skip Turnstile
+    } else if (config.authMode !== 'cf_access' && config.githubAuthRequired) {
+      this.renderGitHubAuthRequired(config.githubAuthEnabled);
+      return;
     }
+
+    this.render();
+    this.applyCfSshCaAvailability();
+    void this.loadSavedCredentials();
+    if (this.cfSshCaEnabled && config.cfAccessEmail) {
+      const badge = document.getElementById('cf-ca-access-badge');
+      const emailSpan = document.getElementById('cf-ca-access-email');
+      if (badge && emailSpan) {
+        emailSpan.textContent = t('auth.cfAccessDetected', { email: config.cfAccessEmail });
+        badge.classList.remove('hidden');
+      }
+    }
+    if (this.cfSshCaEnabled && config.cfAccessTeamName) {
+      const teamInput = document.getElementById('cf-ca-team') as HTMLInputElement | null;
+      if (teamInput && !teamInput.value) teamInput.value = config.cfAccessTeamName;
+    }
+
+    // Access owns its external login flow; preserve the existing SSH CA form behavior.
+    if (config.authMode === 'cf_access') return;
+    if (this.turnstileEnabled && this.turnstileSitekey) this.renderTurnstile();
+    if (config.authMode === 'password') {
+      this.renderAdminLoginButton();
+    } else if (config.githubAuthEnabled) {
+      this.renderGitHubLoginButton();
+    }
+    // GitHub deployments keep the existing #password-setup-only generator entry.
+    if (config.authMode === 'anonymous') this.renderAdminHashGenEntry();
   }
 
   private renderGitHubAuthRequired(githubAuthEnabled: boolean): void {
@@ -145,6 +178,8 @@ export class ConnectionForm {
     `;
     translateDocument(container);
     if (githubAuthEnabled) this.renderGitHubLoginButton();
+    // GitHub 模式（含强制面板）不展示生成器入口：已做出登录选择的用户升级后界面零变化；
+    // 切换密码模式经 #password-setup 路由（README 引导）
   }
 
   private renderGitHubLoginButton(): void {
@@ -162,6 +197,294 @@ export class ConnectionForm {
     document.getElementById('github-login-btn')?.addEventListener('click', () => {
       window.location.href = '/api/auth/github';
     });
+  }
+
+  // ==================== 单管理员密码登录 UI ====================
+
+  /** 密码模式下 GitHub 入口的位置整体替换为管理员登录按钮（同一挂载点） */
+  private renderAdminLoginButton(): void {
+    const placeholder = document.getElementById('github-login-placeholder');
+    if (!placeholder) return;
+
+    placeholder.innerHTML = `
+      <button type="button" id="admin-login-btn" class="github-login-btn text-[11px] font-bold tracking-[0.1em] text-muted hover:text-primary transition-all cursor-pointer flex items-center gap-1.5 bg-transparent border border-dim px-3 py-1 hover:border-[var(--accent)]">
+        <span class="material-symbols-outlined" style="font-size: 14px;" aria-hidden="true">admin_panel_settings</span>
+        <span data-i18n="auth.adminLogin">管理员登录</span>
+      </button>
+    `;
+    translateDocument(placeholder);
+
+    document.getElementById('admin-login-btn')?.addEventListener('click', () => {
+      this.openAdminLoginDialog();
+    });
+  }
+
+  /** REQUIRE_GITHUB_AUTH=true 且密码模式：强制登录面板（文案替换为管理员语义） */
+  private renderAdminAuthRequired(): void {
+    const container = document.getElementById('connection-form-container');
+    if (!container) return;
+
+    // pi-lens-ignore: no-inner-html
+    container.innerHTML = `
+      <div class="flex min-h-[320px] flex-col items-center justify-center gap-5 px-4 text-center" id="admin-auth-required-panel">
+        <span class="material-symbols-outlined text-[var(--accent)]" style="font-size: 42px;" aria-hidden="true">lock</span>
+        <div class="space-y-2">
+          <h2 class="text-sm font-bold tracking-[0.1em] text-on-surface" data-i18n="auth.adminRequired">此 CloudSSH 实例需要管理员登录</h2>
+          <p class="mx-auto max-w-md text-xs leading-6 text-muted" data-i18n="auth.adminRequiredHint">请使用管理员密码登录后使用 SSH 和账号功能。</p>
+        </div>
+        <span id="github-login-placeholder"></span>
+      </div>
+    `;
+    translateDocument(container);
+    this.renderAdminLoginButton();
+  }
+
+  /** 坏哈希 fail closed 错误面板（后端同样拒绝登录，前端同步呈现原因） */
+  private renderAdminHashInvalid(): void {
+    const container = document.getElementById('connection-form-container');
+    if (!container) return;
+
+    // pi-lens-ignore: no-inner-html
+    container.innerHTML = `
+      <div class="flex min-h-[320px] flex-col items-center justify-center gap-5 px-4 text-center">
+        <span class="material-symbols-outlined text-error" style="font-size: 42px;" aria-hidden="true">report</span>
+        <div class="space-y-2">
+          <h2 class="text-sm font-bold tracking-[0.1em] text-on-surface" data-i18n="auth.adminHashInvalidTitle">管理员密码配置无效</h2>
+          <p class="mx-auto max-w-md text-xs leading-6 text-muted" data-i18n="auth.adminHashInvalid">ADMIN_PASSWORD_HASH 格式损坏，登录已停止，请联系管理员修复。</p>
+        </div>
+        <button type="button" id="admin-hash-regen-btn" class="github-login-btn text-[11px] font-bold tracking-[0.1em] text-muted hover:text-primary transition-all cursor-pointer flex items-center gap-1.5 bg-transparent border border-dim px-3 py-1 hover:border-[var(--accent)]">
+          <span class="material-symbols-outlined" style="font-size: 14px;" aria-hidden="true">refresh</span>
+          <span data-i18n="auth.adminHashGenRegenerate">在浏览器中重新生成</span>
+        </button>
+      </div>
+    `;
+    translateDocument(container);
+    document.getElementById('admin-hash-regen-btn')?.addEventListener('click', () => {
+      openAdminHashGeneratorDialog();
+    });
+  }
+
+  /** 匿名/GitHub 模式页脚离散入口：浏览器内生成 ADMIN_PASSWORD_HASH（无需本地 Node 工具） */
+  private renderAdminHashGenEntry(): void {
+    const placeholder = document.getElementById('github-login-placeholder');
+    const row = placeholder?.parentElement;
+    if (!row || document.getElementById('admin-hash-gen-entry')) return;
+
+    const entry = document.createElement('button');
+    entry.type = 'button';
+    entry.id = 'admin-hash-gen-entry';
+    entry.className =
+      'text-[10px] text-muted/70 hover:text-muted transition-all bg-transparent border-none cursor-pointer tracking-[0.05em] px-1';
+    entry.textContent = t('auth.adminHashGenEntry');
+    entry.title = t('auth.adminHashGenHint');
+    entry.addEventListener('click', () => {
+      openAdminHashGeneratorDialog();
+    });
+    row.appendChild(entry);
+  }
+
+  /** 管理员登录对话框：密码输入 + 可选 Turnstile，本地 PBKDF2 预拉伸后提交 */
+  private openAdminLoginDialog(): void {
+    if (!this.passwordAuthParams) return;
+
+    this.closeAdminLoginDialog();
+
+    const sequence = Date.now();
+    const titleId = `admin-login-title-${sequence}`;
+    const dialog = document.createElement('dialog');
+    dialog.id = 'admin-login-dialog';
+    dialog.className = 'auth-challenge-dialog';
+    dialog.setAttribute('aria-labelledby', titleId);
+    dialog.setAttribute('aria-modal', 'true');
+
+    const form = document.createElement('form');
+    form.className = 'auth-challenge-dialog__panel';
+    form.method = 'dialog';
+    form.noValidate = true;
+
+    const accent = document.createElement('div');
+    accent.className = 'auth-challenge-dialog__accent';
+    accent.setAttribute('aria-hidden', 'true');
+
+    const header = document.createElement('div');
+    header.className = 'auth-challenge-dialog__header';
+    const icon = document.createElement('span');
+    icon.className = 'auth-challenge-dialog__icon material-symbols-outlined';
+    icon.textContent = 'admin_panel_settings';
+    icon.setAttribute('aria-hidden', 'true');
+    const title = document.createElement('h2');
+    title.className = 'auth-challenge-dialog__title';
+    title.textContent = t('auth.adminLoginTitle');
+    title.id = titleId;
+    header.append(icon, title);
+
+    const label = document.createElement('label');
+    label.className = 'auth-challenge-dialog__label';
+    label.textContent = t('auth.adminPasswordLabel');
+    const passwordInput = document.createElement('input');
+    passwordInput.type = 'password';
+    passwordInput.className = 'auth-challenge-dialog__input';
+    passwordInput.autocomplete = 'current-password';
+    passwordInput.setAttribute('data-i18n-aria-label', 'auth.adminPasswordLabel');
+    passwordInput.setAttribute('aria-label', t('auth.adminPasswordLabel'));
+
+    const turnstileContainer = document.createElement('div');
+    turnstileContainer.className = 'flex justify-center';
+    let turnstileToken = '';
+    if (this.turnstileEnabled && this.turnstileSitekey && window.turnstile) {
+      const widget = document.createElement('div');
+      turnstileContainer.appendChild(widget);
+      this.adminDialogTurnstileId = window.turnstile.render(widget, {
+        sitekey: this.turnstileSitekey,
+        theme: getActiveColorScheme(),
+        callback: (token: string) => {
+          turnstileToken = token;
+        },
+        'expired-callback': () => {
+          turnstileToken = '';
+        },
+        'error-callback': () => {
+          turnstileToken = '';
+        },
+      });
+    }
+
+    const errorText = document.createElement('div');
+    errorText.className = 'auth-challenge-dialog__warning';
+    errorText.setAttribute('role', 'alert');
+    errorText.style.display = 'none';
+
+    const actions = document.createElement('div');
+    actions.className = 'auth-challenge-dialog__actions';
+    const cancelButton = document.createElement('button');
+    cancelButton.type = 'button';
+    cancelButton.className = 'auth-challenge-dialog__button auth-challenge-dialog__button--cancel';
+    cancelButton.textContent = t('auth.adminLoginCancel');
+    const submitButton = document.createElement('button');
+    submitButton.type = 'button';
+    submitButton.className = 'auth-challenge-dialog__button auth-challenge-dialog__button--submit';
+    submitButton.textContent = t('auth.adminLoginSubmit');
+    actions.append(cancelButton, submitButton);
+
+    form.append(accent, header, label, passwordInput, turnstileContainer, errorText, actions);
+    dialog.appendChild(form);
+    document.body.appendChild(dialog);
+
+    const closeDialog = (): void => this.closeAdminLoginDialog();
+
+    const showError = (message: string): void => {
+      errorText.textContent = message;
+      errorText.style.display = '';
+    };
+
+    let pending = false;
+    const submit = async (): Promise<void> => {
+      if (pending) return;
+      const password = passwordInput.value;
+      if (!password) {
+        showError(t('auth.validationPassword'));
+        passwordInput.focus();
+        return;
+      }
+      // 密码模式下登录必验 Turnstile（与后端 handlePasswordLogin 的必验分支对齐）
+      if (this.turnstileEnabled && this.turnstileSitekey && !turnstileToken) {
+        showError(t('auth.turnstileRequired'));
+        return;
+      }
+      if (!this.passwordAuthParams) return;
+
+      pending = true;
+      submitButton.disabled = true;
+      errorText.style.display = 'none';
+      try {
+        // 浏览器本地 PBKDF2 预拉伸（server relief），原始密码不出浏览器
+        const key = await stretchAdminPassword(
+          password,
+          this.passwordAuthParams.salt,
+          this.passwordAuthParams.iterations
+        );
+        const response = await fetch('/api/auth/password/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key, turnstileToken }),
+        });
+
+        if (response.ok) {
+          // 登录成功：重载进入用户空间（init → /api/auth/me → showUserSpace）
+          closeDialog();
+          window.location.reload();
+          return;
+        }
+
+        // 失败时统一重置 Turnstile 状态与组件，避免二次提交携已消费的旧 Token 导致卡死
+        if (this.turnstileEnabled && this.turnstileSitekey) {
+          turnstileToken = '';
+          if (this.adminDialogTurnstileId && window.turnstile) {
+            try {
+              window.turnstile.reset(this.adminDialogTurnstileId);
+            } catch {
+              /* 容忍已重置或未挂载异常 */
+            }
+          }
+        }
+
+        // 错误按状态码映射 i18n，不回显后端原文
+        if (response.status === 401) {
+          showError(t('auth.adminLoginFailed'));
+          passwordInput.select();
+        } else if (response.status === 429) {
+          const data = (await response.json().catch(() => ({}))) as { retryAfterSec?: number };
+          showError(t('auth.adminLoginLocked', { seconds: data.retryAfterSec ?? 60 }));
+        } else if (response.status === 403) {
+          showError(t('auth.adminLoginTurnstileFailed'));
+        } else if (response.status === 500) {
+          showError(t('auth.adminHashInvalid'));
+        } else if (response.status === 501) {
+          showError(t('auth.adminLoginUnavailable'));
+        } else {
+          showError(t('auth.adminLoginNetwork'));
+        }
+      } catch {
+        showError(t('auth.adminLoginNetwork'));
+      } finally {
+        pending = false;
+        submitButton.disabled = false;
+      }
+    };
+
+    cancelButton.addEventListener('click', closeDialog);
+    dialog.addEventListener('cancel', (e) => {
+      e.preventDefault();
+      closeDialog();
+    });
+    form.addEventListener('submit', (e) => {
+      // method=dialog 的原生提交会绕过清理逻辑，统一走自定义提交闭包
+      e.preventDefault();
+      void submit();
+    });
+    passwordInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        void submit();
+      }
+    });
+    submitButton.addEventListener('click', () => void submit());
+
+    dialog.showModal();
+    passwordInput.focus();
+  }
+
+  /** 关闭并销毁管理员登录对话框（含 Turnstile 组件与密码字段残留清理） */
+  private closeAdminLoginDialog(): void {
+    if (this.adminDialogTurnstileId) {
+      try {
+        window.turnstile?.remove(this.adminDialogTurnstileId);
+      } catch {
+        /* 组件已随 DOM 移除时静默容忍 */
+      }
+      this.adminDialogTurnstileId = null;
+    }
+    document.getElementById('admin-login-dialog')?.remove();
   }
 
   private renderTurnstile(): void {
@@ -215,15 +538,15 @@ export class ConnectionForm {
     // pi-lens-ignore: no-inner-html
     container.innerHTML = `
       <form class="space-y-6" id="connection-form">
-        <div class="grid grid-cols-1 sm:grid-cols-4 gap-4">
-          <div class="sm:col-span-3">
+        <div class="ssh-endpoint-fields">
+          <div class="ssh-host-field">
             <label for="host" class="block text-xs font-bold tracking-[0.1em] text-muted mb-2" data-i18n="auth.host">主机地址</label>
             <div class="flex items-center">
               <span class="text-muted mr-2">&gt;</span>
                <input id="host" class="terminal-input text-[13px]" placeholder="192.168.1.1 or 2001:db8::1" type="text" required>
             </div>
           </div>
-          <div class="sm:col-span-1">
+          <div class="ssh-port-field">
             <label for="port" class="block text-xs font-bold tracking-[0.1em] text-muted mb-2" data-i18n="auth.port">端口</label>
             <div class="flex items-center">
               <span class="text-muted mr-2">:</span>
@@ -243,12 +566,29 @@ export class ConnectionForm {
           <div class="flex gap-2 mb-3">
             <button type="button" id="auth-tab-password" class="auth-tab auth-tab-active px-3 py-1 text-[11px] font-bold tracking-[0.1em] cursor-pointer transition-all" data-i18n="common.password">密码</button>
             <button type="button" id="auth-tab-key" class="auth-tab px-3 py-1 text-[11px] font-bold tracking-[0.1em] cursor-pointer transition-all" data-i18n="common.privateKey">私钥</button>
+            <button type="button" id="auth-tab-cf-ca" class="auth-tab hidden px-3 py-1 text-[11px] font-bold tracking-[0.1em] cursor-pointer transition-all" data-i18n="auth.cfSshCa">Cloudflare CA</button>
+            <button type="button" id="auth-tab-none" class="auth-tab px-3 py-1 text-[11px] font-bold tracking-[0.1em] cursor-pointer transition-all" data-i18n="auth.none"></button>
+          </div>
+          <p id="auth-none-section" class="text-xs text-muted" style="display:none;" data-i18n="auth.noneHint"></p>
+          <div id="auth-cf-ca-section" style="display:none;" class="space-y-3">
+            <div>
+              <label for="cf-ca-team" class="block text-[11px] font-bold tracking-[0.1em] text-muted mb-1" data-i18n="auth.cfTeamName">Zero Trust 团队标识</label>
+              <div class="flex items-center">
+                <span class="material-symbols-outlined text-muted mr-2" style="font-size: 16px;">verified_user</span>
+                <input id="cf-ca-team" class="terminal-input text-[13px]" data-i18n-placeholder="auth.cfTeamNamePlaceholder" placeholder="mycompany" type="text" autocomplete="off">
+              </div>
+            </div>
+            <div id="cf-ca-access-badge" class="hidden text-[11px] text-[var(--accent)] flex items-center gap-1.5 p-2 border border-dim bg-surface/40">
+              <span class="material-symbols-outlined" style="font-size: 14px;">check_circle</span>
+              <span id="cf-ca-access-email"></span>
+            </div>
           </div>
           <div id="auth-password-section">
             <div class="flex items-center">
               <span class="material-symbols-outlined text-muted mr-2" style="font-size: 16px;">key</span>
-              <input id="password" class="terminal-input text-[13px]" placeholder="••••••••" type="password" data-i18n-aria-label="common.password" aria-label="密码">
+              <input id="password" class="terminal-input text-[13px]" placeholder="••••••••" type="password" data-i18n-aria-label="common.password" aria-label="密码" aria-describedby="auth-password-hint">
             </div>
+            <p id="auth-password-hint" class="text-xs text-muted mt-2" data-i18n="auth.passwordHint"></p>
           </div>
           <div id="auth-key-section" style="display:none;">
             <textarea id="private-key" class="terminal-input text-[11px] w-full" rows="5" data-i18n-placeholder="auth.keyPlaceholder" data-i18n-aria-label="common.privateKey" aria-label="私钥" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...粘贴私钥内容...&#10;-----END OPENSSH PRIVATE KEY-----" style="resize:vertical;border:1px solid var(--border-strong);padding:8px;"></textarea>
@@ -281,7 +621,7 @@ export class ConnectionForm {
             <span data-i18n="auth.execute">建立连接</span>
           </button>
         </div>
-        <div class="flex justify-between items-center mt-4">
+        <div class="flex flex-wrap justify-between items-center gap-x-2 gap-y-1 mt-4">
           <span id="status-text" class="text-[13px] text-muted flex items-center gap-1">
             <span class="w-2 h-2 bg-surface-dot inline-block"></span> <span data-i18n="auth.statusOffline">状态：离线</span>
           </span>
@@ -314,6 +654,12 @@ export class ConnectionForm {
     document.getElementById('auth-tab-key')!.addEventListener('click', () => {
       this.setAuthMode('key');
     });
+    document.getElementById('auth-tab-cf-ca')!.addEventListener('click', () => {
+      this.setAuthMode('cf_ca');
+    });
+    document.getElementById('auth-tab-none')!.addEventListener('click', () => {
+      this.setAuthMode('none');
+    });
 
     // File upload for private key
     const fileInput = document.getElementById('private-key-file') as HTMLInputElement;
@@ -342,19 +688,30 @@ export class ConnectionForm {
     });
   }
 
-  private authMode: 'password' | 'key' = 'password';
+  private authMode: 'password' | 'key' | 'none' | 'cf_ca' = 'password';
+  private connectionGeneration = 0;
+  /** 仅 Cloudflare Access 登录模式展示 SSH CA；其他模式没有 Access JWT，入口直接隐藏。 */
+  private cfSshCaEnabled = false;
 
-  private setAuthMode(mode: 'password' | 'key'): void {
+  private applyCfSshCaAvailability(): void {
+    document.getElementById('auth-tab-cf-ca')?.classList.toggle('hidden', !this.cfSshCaEnabled);
+    if (!this.cfSshCaEnabled && this.authMode === 'cf_ca') {
+      this.setAuthMode('password');
+    }
+  }
+
+  private setAuthMode(mode: 'password' | 'key' | 'none' | 'cf_ca'): void {
+    if (mode === 'cf_ca' && !this.cfSshCaEnabled) return;
+    this.connectionGeneration++;
     this.authMode = mode;
-    const pwTab = document.getElementById('auth-tab-password')!;
-    const keyTab = document.getElementById('auth-tab-key')!;
-    const pwSection = document.getElementById('auth-password-section')!;
-    const keySection = document.getElementById('auth-key-section')!;
-
-    pwTab.classList.toggle('auth-tab-active', mode === 'password');
-    keyTab.classList.toggle('auth-tab-active', mode === 'key');
-    pwSection.style.display = mode === 'password' ? '' : 'none';
-    keySection.style.display = mode === 'key' ? '' : 'none';
+    for (const value of ['password', 'key', 'none', 'cf_ca'] as const) {
+      const tabId = value === 'cf_ca' ? 'auth-tab-cf-ca' : `auth-tab-${value}`;
+      const tab = document.getElementById(tabId)!;
+      tab.classList.toggle('auth-tab-active', mode === value);
+      tab.setAttribute('aria-pressed', String(mode === value));
+      document.getElementById(`auth-${value === 'cf_ca' ? 'cf-ca' : value}-section`)!.style.display =
+        mode === value ? '' : 'none';
+    }
   }
 
   private renderRecentConnections(): void {
@@ -384,20 +741,32 @@ export class ConnectionForm {
       itemEl.className =
         'flex justify-between items-center text-xs p-2 border border-dim bg-surface/50 hover:bg-surface hover:border-[var(--accent)] transition-all cursor-pointer group relative';
 
-      const authLabel = item.authMethod === 'publickey' ? 'KEY' : 'PWD';
+      const isCfCa = this.cfSshCaEnabled && (item.authMethod as string) === 'cf_ca';
+      const authLabel =
+        item.authMethod === 'none'
+          ? 'NONE'
+          : isCfCa
+            ? 'CF CA'
+            : item.authMethod === 'publickey'
+              ? 'KEY'
+              : 'PWD';
       const labelText = `${item.username}@${item.host}:${item.port}`;
 
       // pi-lens-ignore: no-inner-html
       itemEl.innerHTML = `
         <div class="flex items-center gap-2 overflow-hidden mr-2 select-none flex-1">
           <span class="material-symbols-outlined text-muted" style="font-size: 14px;">history</span>
-          <span class="text-on-surface truncate" title="${labelText}">${labelText}</span>
+          <span class="recent-connection-label text-on-surface truncate"></span>
           <span class="text-[9px] font-bold tracking-[0.05em] text-muted border border-dim px-1.5 py-0.2 shrink-0">${authLabel}</span>
         </div>
         <button type="button" class="delete-history-btn text-muted hover:text-error flex items-center justify-center p-0.5" title="${t('auth.removeHistory')}">
           <span class="material-symbols-outlined" style="font-size: 14px;">close</span>
         </button>
       `;
+
+      const label = itemEl.querySelector<HTMLElement>('.recent-connection-label')!;
+      label.textContent = labelText;
+      label.title = labelText;
 
       // 点击填入
       itemEl.addEventListener('click', (e) => {
@@ -419,7 +788,7 @@ export class ConnectionForm {
     host: string;
     port: number;
     username: string;
-    authMethod: 'password' | 'publickey';
+    authMethod: 'password' | 'publickey' | 'none';
     encryptedCred?: string;
     region?: string;
   }): Promise<void> {
@@ -433,10 +802,16 @@ export class ConnectionForm {
       anonRegionSelect.value = item.region || '';
     }
 
-    if (item.authMethod === 'publickey') {
-      this.setAuthMode('key');
+    if (this.cfSshCaEnabled && (item.authMethod as string) === 'cf_ca') {
+      this.setAuthMode('cf_ca');
+      const teamInput = document.getElementById('cf-ca-team') as HTMLInputElement | null;
+      if (teamInput && (item as any).cfTeamName) {
+        teamInput.value = (item as any).cfTeamName;
+      }
     } else {
-      this.setAuthMode('password');
+      this.setAuthMode(
+        item.authMethod === 'publickey' ? 'key' : item.authMethod === 'none' ? 'none' : 'password'
+      );
     }
 
     if (item.encryptedCred) {
@@ -515,6 +890,8 @@ export class ConnectionForm {
   }
 
   private async handleConnect(): Promise<void> {
+    const connectButton = document.getElementById('connect-btn') as HTMLButtonElement;
+    if (connectButton.disabled) return;
     const hostInput = (document.getElementById('host') as HTMLInputElement).value;
     const host = hostInput.replace(/^\[|\]$/g, '').trim();
     const portInput = document.getElementById('port') as HTMLInputElement;
@@ -523,8 +900,11 @@ export class ConnectionForm {
     const password = (document.getElementById('password') as HTMLInputElement).value;
     const privateKey = (document.getElementById('private-key') as HTMLTextAreaElement).value;
     const selectedPassword = this.authMode === 'password' ? password : undefined;
-    const selectedPrivateKey = this.authMode === 'key' ? privateKey : undefined;
-    const remember = (document.getElementById('remember-me') as HTMLInputElement).checked;
+    let selectedPrivateKey = this.authMode === 'key' ? privateKey : undefined;
+    const authMethod = this.authMode === 'password' ? 'password' : this.authMode === 'none' ? 'none' : 'publickey';
+    let certificate: string | undefined;
+
+    let remember = (document.getElementById('remember-me') as HTMLInputElement).checked;
     // 匿名路径区域选择（仅作为 manual override；系统不会对此路径自动推断）
     const anonRegionSelect = document.getElementById('anon-region') as HTMLSelectElement | null;
     const regionValue = anonRegionSelect ? anonRegionSelect.value : '';
@@ -544,15 +924,6 @@ export class ConnectionForm {
         variant: 'warning',
       });
       portInput.focus();
-      return;
-    }
-
-    if (this.authMode === 'password' && !password) {
-      notify(t('auth.validationPassword'), {
-        title: t('auth.incompleteCredentials'),
-        variant: 'warning',
-      });
-      (document.getElementById('password') as HTMLInputElement)?.focus();
       return;
     }
 
@@ -577,6 +948,75 @@ export class ConnectionForm {
       return;
     }
 
+    let cfTeamName: string | undefined;
+    if (this.authMode === 'cf_ca') {
+      if (!this.cfSshCaEnabled) {
+        this.setAuthMode('password');
+        return;
+      }
+      remember = false;
+      const teamInput = document.getElementById('cf-ca-team') as HTMLInputElement | null;
+      cfTeamName = teamInput?.value.trim() || '';
+      if (!cfTeamName) {
+        notify(t('auth.cfTeamRequired'), {
+          title: t('auth.incompleteCredentials'),
+          variant: 'warning',
+        });
+        teamInput?.focus();
+        return;
+      }
+      const statusTextEl = document.getElementById('status-text');
+      if (statusTextEl) {
+        // pi-lens-ignore: no-inner-html
+        statusTextEl.innerHTML = `<span class="w-2 h-2 bg-primary-container animate-pulse inline-block"></span> ${t('auth.cfMinting')}`;
+      }
+      const generation = this.connectionGeneration;
+      const isCurrent = () => generation === this.connectionGeneration && this.authMode === 'cf_ca' &&
+        this.cfSshCaEnabled && !document.getElementById('auth-section')!.classList.contains('hidden') &&
+        (document.getElementById('host') as HTMLInputElement).value === hostInput &&
+        (document.getElementById('username') as HTMLInputElement).value === username &&
+        parsePort(portInput.value) === port && teamInput?.value.trim() === cfTeamName;
+      connectButton.disabled = true;
+      try {
+        const creds = await requestCloudflareSshCertificate(cfTeamName);
+        if (!isCurrent()) return;
+        selectedPrivateKey = creds.privateKey;
+        certificate = creds.certificate;
+      } catch (err: any) {
+        if (!isCurrent()) return;
+        notify(err.message || t('server.connectFailed'), {
+          title: t('server.connectFailed'),
+          variant: 'danger',
+        });
+        return;
+      } finally {
+        connectButton.disabled = false;
+        if (statusTextEl && !document.getElementById('auth-section')!.classList.contains('hidden')) {
+          // pi-lens-ignore: no-inner-html
+          statusTextEl.innerHTML = `<span class="w-2 h-2 bg-surface-dot inline-block"></span> ${t('auth.statusOffline')}`;
+        }
+      }
+    }
+
+    if (this.authMode === 'key' && selectedPrivateKey) {
+      connectButton.disabled = true;
+      try {
+        const prepared = await preparePrivateKey(selectedPrivateKey, false);
+        if (!prepared || this.authMode !== 'key' ||
+            document.getElementById('auth-section')!.classList.contains('hidden') ||
+            (document.getElementById('host') as HTMLInputElement).value !== hostInput ||
+            (document.getElementById('username') as HTMLInputElement).value !== username ||
+            (document.getElementById('private-key') as HTMLTextAreaElement).value !== privateKey ||
+            parsePort(portInput.value) !== port) return;
+        selectedPrivateKey = prepared.key;
+        if (prepared.unlocked) {
+          remember = false;
+          (document.getElementById('remember-me') as HTMLInputElement).checked = false;
+          notify(t('auth.keyUnlockTransient'), { variant: 'info' });
+        }
+      } finally { connectButton.disabled = false; }
+    }
+
     // 保存连接历史与凭据
     let encryptedCred: string | undefined;
     if (remember) {
@@ -586,7 +1026,7 @@ export class ConnectionForm {
         username,
         password: selectedPassword ?? '',
         privateKey: selectedPrivateKey,
-        authMethod: this.authMode === 'key' ? 'publickey' : 'password',
+        authMethod,
       });
     }
 
@@ -601,16 +1041,23 @@ export class ConnectionForm {
     }
 
     const id = `${username}@${host}:${port}`;
-    const newRecord = {
+    const newRecord: Record<string, unknown> = {
       id,
       host,
       port,
       username,
-      authMethod: this.authMode === 'key' ? 'publickey' : 'password',
+      authMethod: this.authMode === 'cf_ca' ? 'cf_ca' : authMethod,
       timestamp: Date.now(),
-      ...(regionValue ? { region: regionValue } : {}), // 区域偏好持久化到 recent
-      ...(encryptedCred ? { encryptedCred } : {}),
     };
+    if (this.authMode === 'cf_ca' && cfTeamName) {
+      newRecord.cfTeamName = cfTeamName;
+    }
+    if (regionValue) {
+      newRecord.region = regionValue;
+    }
+    if (encryptedCred) {
+      newRecord.encryptedCred = encryptedCred;
+    }
 
     // 去重：如果已有相同 id 记录，先删除
     recent = recent.filter((r) => r.id !== id);
@@ -648,8 +1095,9 @@ export class ConnectionForm {
         port,
         username,
         password: selectedPassword,
-        authMethod: this.authMode === 'key' ? 'publickey' : 'password',
+        authMethod,
         privateKey: selectedPrivateKey,
+        certificate,
         expectedFingerprint: expectedFingerprint || undefined,
         locationHint: regionValue || undefined,
       });

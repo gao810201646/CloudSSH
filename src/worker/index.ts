@@ -1,15 +1,40 @@
-import { normalizeThemeData, THEME_MAX_BYTES } from '../theme-schema';
+import { normalizeAIBaseUrl } from '../ai-endpoint';
+import { readProviderModelLimits } from '../ai-model-policy';
+import {
+  normalizeMobileShortcutsPayload,
+  SHORTCUTS_MAX_BYTES,
+} from '../mobile-shortcuts-schema';
+import {
+  MAX_CUSTOM_THEMES,
+  normalizeThemeData,
+  normalizeUserThemePayload,
+  THEME_MAX_BYTES,
+} from '../theme-schema';
 import { ALLOWED_LOCATION_HINTS, type Env, type SSHConnectionConfig } from '../types';
 import {
   getAuthenticatedUser,
+  getCFAccessEmail,
+  initializeAccessIdentity,
+  isConnectTokenRouteAllowed,
   handleGetMe,
   handleGitHubAuth,
   handleGitHubCallback,
   handleLogout,
+  handlePasswordLogin,
   isGitHubAuthRequired,
-  isGitHubUserAllowed,
+  isSshIdentityAllowed,
+  getPasswordAuthParams,
+  parseAdminPasswordHash,
+  resolveAuthMode,
+  verifyTurnstile,
+  userDbRouteKey,
+  connectTokenRouteKey,
 } from './auth';
-import { HTML } from './html';
+import { createHtmlResponse } from './html-cache';
+import { handleVersionCheck } from './version-check';
+import { handleCloudflareSshCaSign } from './cf-ssh-ca';
+import { handleMcp, handleMcpManagement } from './mcp';
+export { MCPExecutionDO } from './mcp-execution';
 
 export { SSHSessionDO } from './durable-object';
 export { SSHShareDO } from './share-do';
@@ -59,20 +84,6 @@ function getRateLimitRetryAfter(ip: string | null): number | null {
 
   record.count++;
   return null;
-}
-
-async function verifyTurnstile(token: string, secret: string, ip: string): Promise<boolean> {
-  try {
-    const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `secret=${secret}&response=${token}&remoteip=${ip}`,
-    });
-    const result = await response.json<{ success: boolean }>();
-    return result.success === true;
-  } catch {
-    return false;
-  }
 }
 
 // --- Simple token-based verification for session-level ---
@@ -171,9 +182,31 @@ function validateRegion(v: string | null | undefined): string | undefined {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx?: Pick<ExecutionContext, 'access'>
+  ): Promise<Response> {
     try {
+      await initializeAccessIdentity(request, ctx);
       const url = new URL(request.url);
+
+      // SameSite cookies also reach sibling origins. Reject browser-originated
+      // cross-origin writes, while retaining existing non-browser API clients.
+      if (url.pathname.startsWith('/api/') && !['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {
+        const origin = request.headers.get('Origin');
+        if (origin !== null && origin !== url.origin) {
+          return Response.json({ error: 'Forbidden' }, { status: 403 });
+        }
+      }
+
+      if (url.pathname === '/mcp') return await handleMcp(request, env);
+      if (url.pathname.startsWith('/api/mcp/')) {
+        const response = await handleMcpManagement(request, env);
+        const headers = new Headers(response.headers);
+        headers.set('Cache-Control', 'no-store');
+        return new Response(response.body, { status: response.status, headers });
+      }
 
       // ==================== Auth Routes ====================
 
@@ -187,6 +220,12 @@ export default {
 
       if (url.pathname === '/api/auth/logout' && request.method === 'POST') {
         return handleLogout(request, env);
+      }
+
+      // ==================== 单管理员密码登录 ====================
+
+      if (url.pathname === '/api/auth/password/login' && request.method === 'POST') {
+        return handlePasswordLogin(request, env);
       }
 
       if (url.pathname === '/api/auth/me') {
@@ -208,13 +247,20 @@ export default {
       // ==================== Servers Routes (需认证) ====================
 
       if (url.pathname === '/api/servers' || url.pathname.startsWith('/api/servers/')) {
-        return handleServersRoute(request, url, env);
+        // await 后 DO 抛出的异常才能被本函数的 catch 转成 JSON，而不是边缘的 1101 页面。
+        return await handleServersRoute(request, url, env);
       }
 
       // ==================== Theme Routes（登录用户跨环境同步） ====================
 
       if (url.pathname === '/api/user/theme') {
         return handleThemeRoute(request, env);
+      }
+
+      // ==================== 移动端快捷键配置 Routes (需认证) ====================
+
+      if (url.pathname === '/api/user/mobile-shortcuts') {
+        return handleMobileShortcutsRoute(request, env);
       }
 
       // ==================== known_hosts Routes (需认证) ====================
@@ -337,29 +383,47 @@ export default {
         return Response.json({ status: 'ok', timestamp: Date.now() });
       }
 
+      // Public, cached metadata only; never tied to sessions or user credentials.
+      if (url.pathname === '/api/version') {
+        return handleVersionCheck(request);
+      }
+
+      // ==================== Cloudflare SSH CA 签发代理 ====================
+
+      if (url.pathname === '/api/cf-ssh-ca/sign' && request.method === 'POST') {
+        if (!hasSameWebSocketOrigin(request, url)) {
+          return new Response('Forbidden', { status: 403 });
+        }
+        if (resolveAuthMode(env, request) !== 'cf_access' || !getCFAccessEmail(request)) {
+          return Response.json({ error: 'Cloudflare Access authentication required' }, { status: 401 });
+        }
+        return await handleCloudflareSshCaSign(request);
+      }
+
       // Return config info (includes GitHub auth availability)
       if (url.pathname === '/api/config') {
+        const authMode = resolveAuthMode(env, request);
+        const cfAccessEmail = getCFAccessEmail(request);
         return Response.json({
           turnstileEnabled: !!env.TURNSTILE_SECRET,
           sitekey: env.TURNSTILE_SITEKEY || '',
-          githubAuthEnabled: !!(env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET),
-          githubAuthRequired: isGitHubAuthRequired(env),
+          // 密码模式/CF Access 模式下 GitHub 入口被禁用
+          githubAuthEnabled: authMode === 'github',
+          githubAuthRequired: isGitHubAuthRequired(env) || authMode === 'cf_access',
           sshSharingEnabled: isSSHSharingEnabled(env),
+          authMode,
+          cfAccessEmail,
+          cfAccessTeamName: env.CF_ACCESS_TEAM_NAME || '',
+          // 浏览器预拉伸公开参数（盐非机密）；坏哈希时为 null
+          passwordAuth: authMode === 'password' ? getPasswordAuthParams(env) : null,
+          passwordHashInvalid:
+            authMode === 'password' && parseAdminPasswordHash(env.ADMIN_PASSWORD_HASH) === 'invalid',
         });
       }
 
-      return new Response(HTML, {
-        headers: {
-          'Content-Type': 'text/html;charset=UTF-8',
-          'X-Content-Type-Options': 'nosniff',
-          'X-Frame-Options': 'DENY',
-          'Referrer-Policy': 'strict-origin-when-cross-origin',
-          'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
-        },
-      });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.error('Unhandled error in fetch handler:', msg);
+      return createHtmlResponse(request);
+    } catch {
+      console.error('Worker request failed');
       return Response.json({ error: 'Internal Server Error' }, { status: 500 });
     }
   },
@@ -374,7 +438,7 @@ async function handleServersRoute(request: Request, url: URL, env: Env): Promise
     return Response.json({ error: 'Authentication required' }, { status: 401 });
   }
 
-  const stub = getUserDBStub(env, user.github_id);
+  const stub = getUserDBStub(env, await userDbRouteKey(user));
 
   // GET /api/servers
   if (url.pathname === '/api/servers' && request.method === 'GET') {
@@ -466,7 +530,7 @@ async function handleServersRoute(request: Request, url: URL, env: Env): Promise
             shareId,
             tokenHash: shareRef,
             ownerUserId: user.id,
-            ownerGithubId: String(user.github_id),
+            ownerGithubId: await userDbRouteKey(user),
             serverId: Number(serverId),
             serverName: metadata.serverName,
             expiresAt,
@@ -500,15 +564,133 @@ async function handleServersRoute(request: Request, url: URL, env: Env): Promise
     return new Response('Method Not Allowed', { status: 405 });
   }
 
+  // /api/servers/:id/memory
+  const memoryMatch = url.pathname.match(/^\/api\/servers\/(\d+)\/memory$/);
+  if (memoryMatch) {
+    const serverId = memoryMatch[1];
+    if (request.method === 'GET') {
+      return stub.fetch(
+        new Request(`http://internal/internal/servers/${serverId}/memory?user_id=${user.id}`, {
+          method: 'GET',
+        })
+      );
+    }
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+
+  // /api/servers/:id/work-logs/:logId
+  const singleWorkLogMatch = url.pathname.match(/^\/api\/servers\/(\d+)\/work-logs\/(\d+)$/);
+  if (singleWorkLogMatch) {
+    const serverId = singleWorkLogMatch[1];
+    const logId = singleWorkLogMatch[2];
+    if (request.method === 'DELETE') {
+      return stub.fetch(
+        new Request(
+          `http://internal/internal/servers/${serverId}/work-logs/${logId}?user_id=${user.id}`,
+          {
+            method: 'DELETE',
+          }
+        )
+      );
+    }
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+
+  // /api/servers/:id/work-logs
+  const workLogsMatch = url.pathname.match(/^\/api\/servers\/(\d+)\/work-logs$/);
+  if (workLogsMatch) {
+    const serverId = workLogsMatch[1];
+    if (request.method === 'POST') {
+      const body = await request.json<Record<string, unknown>>();
+      body.user_id = user.id;
+      return stub.fetch(
+        new Request(`http://internal/internal/servers/${serverId}/work-logs`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+      );
+    }
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+
+  // /api/servers/:id/knowledge/batch
+  const batchKnowledgeMatch = url.pathname.match(/^\/api\/servers\/(\d+)\/knowledge\/batch$/);
+  if (batchKnowledgeMatch) {
+    const serverId = batchKnowledgeMatch[1];
+    if (request.method === 'DELETE') {
+      const body = await request.json<Record<string, unknown>>();
+      body.user_id = user.id;
+      return stub.fetch(
+        new Request(`http://internal/internal/servers/${serverId}/knowledge/batch`, {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+      );
+    }
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+
+  // /api/servers/:id/knowledge/:kId
+  const singleKnowledgeMatch = url.pathname.match(/^\/api\/servers\/(\d+)\/knowledge\/(\d+)$/);
+  if (singleKnowledgeMatch) {
+    const serverId = singleKnowledgeMatch[1];
+    const kId = singleKnowledgeMatch[2];
+    if (request.method === 'DELETE') {
+      return stub.fetch(
+        new Request(
+          `http://internal/internal/servers/${serverId}/knowledge/${kId}?user_id=${user.id}`,
+          {
+            method: 'DELETE',
+          }
+        )
+      );
+    }
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+
+  // /api/servers/:id/knowledge
+  const knowledgeMatch = url.pathname.match(/^\/api\/servers\/(\d+)\/knowledge$/);
+  if (knowledgeMatch) {
+    const serverId = knowledgeMatch[1];
+    if (request.method === 'POST') {
+      const body = await request.json<Record<string, unknown>>();
+      body.user_id = user.id;
+      return stub.fetch(
+        new Request(`http://internal/internal/servers/${serverId}/knowledge`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+      );
+    }
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+
   // /api/servers/:id/connect
   const connectMatch = url.pathname.match(/^\/api\/servers\/(\d+)\/connect$/);
   if (connectMatch && request.method === 'POST') {
     const serverId = connectMatch[1];
+    let ephemeralCredential: string | undefined;
+    try {
+      const connectBody = await request.json<{ ephemeralCredential?: string }>();
+      if (typeof connectBody.ephemeralCredential === 'string' && connectBody.ephemeralCredential.length <= 64 * 1024) {
+        ephemeralCredential = connectBody.ephemeralCredential;
+      }
+    } catch {
+      /* 请求不带 JSON 正文属正常常规连接 */
+    }
+
     const tokenRes = await stub.fetch(
       new Request(`http://internal/internal/servers/${serverId}/connect`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_id: user.id }),
+        body: JSON.stringify({
+          user_id: user.id,
+          ephemeralCredential,
+          routeKey: await userDbRouteKey(user),
+        }),
       })
     );
 
@@ -561,7 +743,7 @@ async function handleThemeRoute(request: Request, env: Env): Promise<Response> {
     return Response.json({ error: 'Authentication required' }, { status: 401 });
   }
 
-  const stub = getUserDBStub(env, user.github_id);
+  const stub = getUserDBStub(env, await userDbRouteKey(user));
 
   if (request.method === 'GET') {
     return stub.fetch(
@@ -578,6 +760,30 @@ async function handleThemeRoute(request: Request, env: Env): Promise<Response> {
     } catch {
       return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
     }
+
+    // 支持多套主题 payload：{ themes: [...], active_id: ... }
+    if (Array.isArray(body.themes)) {
+      if (body.themes.length > MAX_CUSTOM_THEMES) {
+        return Response.json({ error: 'Too many custom themes' }, { status: 400 });
+      }
+      const rawSerialized = JSON.stringify(body);
+      if (new TextEncoder().encode(rawSerialized).byteLength > MAX_CUSTOM_THEMES * THEME_MAX_BYTES) {
+        return Response.json({ error: 'Themes payload is too large' }, { status: 413 });
+      }
+      const normalizedPayload = normalizeUserThemePayload(body);
+      if (!normalizedPayload) {
+        return Response.json({ error: 'Invalid theme data' }, { status: 400 });
+      }
+      return stub.fetch(
+        new Request('http://internal/internal/theme', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user_id: user.id, theme_data: JSON.stringify(normalizedPayload) }),
+        })
+      );
+    }
+
+    // 兼容原有的单个主题保存：{ theme_data: ... }
     const rawThemeData = body.theme_data;
     if (!rawThemeData || typeof rawThemeData !== 'object' || Array.isArray(rawThemeData)) {
       return Response.json({ error: 'Invalid theme data' }, { status: 400 });
@@ -600,6 +806,102 @@ async function handleThemeRoute(request: Request, env: Env): Promise<Response> {
     );
   }
 
+  if (request.method === 'DELETE') {
+    let themeId: string | null = null;
+    try {
+      const url = new URL(request.url);
+      themeId = url.searchParams.get('id');
+    } catch {
+      // ignore malformed URL
+    }
+    const targetUrl = themeId
+      ? `http://internal/internal/theme?user_id=${user.id}&theme_id=${encodeURIComponent(themeId)}`
+      : `http://internal/internal/theme?user_id=${user.id}`;
+    return stub.fetch(
+      new Request(targetUrl, {
+        method: 'DELETE',
+      })
+    );
+  }
+
+  return Response.json({ error: 'Method not allowed' }, { status: 405 });
+}
+
+// ==================== 移动端快捷键配置 routes ====================
+
+async function handleMobileShortcutsRoute(request: Request, env: Env): Promise<Response> {
+  const user = await getAuthenticatedUser(request, env);
+  if (!user) {
+    return Response.json({ error: 'Authentication required' }, { status: 401 });
+  }
+
+  const stub = getUserDBStub(env, await userDbRouteKey(user));
+
+  if (request.method === 'GET') {
+    return stub.fetch(
+      new Request(`http://internal/internal/mobile-shortcuts?user_id=${user.id}`, {
+        method: 'GET',
+      })
+    );
+  }
+
+  if (request.method === 'PUT') {
+    const origin = request.headers.get('Origin');
+    let requestOrigin: string | null = null;
+    try {
+      requestOrigin = new URL(request.url).origin;
+    } catch {
+      return Response.json({ error: 'Forbidden' }, { status: 403 });
+    }
+    if (origin && origin !== requestOrigin) {
+      return Response.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
+    let body: unknown;
+    try {
+      body = await request.json<unknown>();
+    } catch {
+      return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
+    }
+
+    const rawSerialized = JSON.stringify(body);
+    if (new TextEncoder().encode(rawSerialized).byteLength > SHORTCUTS_MAX_BYTES) {
+      return Response.json({ error: 'Shortcuts payload is too large' }, { status: 413 });
+    }
+
+    const normalized = normalizeMobileShortcutsPayload(body);
+    if (!normalized) {
+      return Response.json({ error: 'Invalid shortcuts data' }, { status: 400 });
+    }
+
+    return stub.fetch(
+      new Request('http://internal/internal/mobile-shortcuts', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: user.id, shortcuts_data: JSON.stringify(normalized) }),
+      })
+    );
+  }
+
+  if (request.method === 'DELETE') {
+    const origin = request.headers.get('Origin');
+    let requestOrigin: string | null = null;
+    try {
+      requestOrigin = new URL(request.url).origin;
+    } catch {
+      return Response.json({ error: 'Forbidden' }, { status: 403 });
+    }
+    if (origin && origin !== requestOrigin) {
+      return Response.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
+    return stub.fetch(
+      new Request(`http://internal/internal/mobile-shortcuts?user_id=${user.id}`, {
+        method: 'DELETE',
+      })
+    );
+  }
+
   return Response.json({ error: 'Method not allowed' }, { status: 405 });
 }
 
@@ -611,7 +913,7 @@ async function handleKnownHostsRoute(request: Request, url: URL, env: Env): Prom
     return Response.json({ error: 'Authentication required' }, { status: 401 });
   }
 
-  const stub = getUserDBStub(env, user.github_id);
+  const stub = getUserDBStub(env, await userDbRouteKey(user));
 
   // GET /api/known-hosts?host=X&port=Y  → 获取特定主机指纹
   // GET /api/known-hosts                 → 列出所有已知主机
@@ -664,7 +966,7 @@ async function handleSnippetsRoute(request: Request, url: URL, env: Env): Promis
   if (!user) {
     return Response.json({ error: 'Authentication required' }, { status: 401 });
   }
-  const stub = getUserDBStub(env, user.github_id);
+  const stub = getUserDBStub(env, await userDbRouteKey(user));
   if (url.pathname === '/api/snippets' && request.method === 'GET') {
     return stub.fetch(
       new Request(`http://internal/internal/snippets?user_id=${user.id}`, { method: 'GET' })
@@ -720,13 +1022,39 @@ async function handleSnippetsRoute(request: Request, url: URL, env: Env): Promis
 
 // ==================== AI config routes ====================
 
+function isSameBaseUrl(urlA: string, urlB: string): boolean {
+  try {
+    return normalizeAIBaseUrl(urlA) === normalizeAIBaseUrl(urlB);
+  } catch {
+    return false;
+  }
+}
+
+function sanitizeAIErrorMessage(msg: string, secret?: string): string {
+  let sanitized = msg;
+  if (secret && secret.length >= 4) {
+    sanitized = sanitized.replaceAll(secret, '***');
+  }
+  // 脱敏潜在的 Bearer token 格式
+  sanitized = sanitized.replace(/Bearer\s+[a-zA-Z0-9_\-.]{8,}/gi, 'Bearer ***');
+  return sanitized;
+}
+
 async function handleAIRoute(request: Request, url: URL, env: Env): Promise<Response> {
   const user = await getAuthenticatedUser(request, env);
   if (!user) {
     return Response.json({ error: 'Authentication required' }, { status: 401 });
   }
 
-  const stub = getUserDBStub(env, user.github_id);
+  // 同源安全校验（CSRF 防护）
+  if (request.method === 'POST' || request.method === 'PUT') {
+    const origin = request.headers.get('Origin');
+    if (origin && origin !== url.origin) {
+      return Response.json({ error: 'Forbidden' }, { status: 403 });
+    }
+  }
+
+  const stub = getUserDBStub(env, await userDbRouteKey(user));
 
   // GET /api/ai/config — return current AI config (masked)
   if (url.pathname === '/api/ai/config' && request.method === 'GET') {
@@ -744,6 +1072,11 @@ async function handleAIRoute(request: Request, url: URL, env: Env): Promise<Resp
 
     // SSRF validation for base_url
     if (body.base_url) {
+      try {
+        body.base_url = normalizeAIBaseUrl(body.base_url as string);
+      } catch {
+        return Response.json({ error: 'Invalid Responses API address', code: 'responses_address' }, { status: 400 });
+      }
       const { validateBaseUrlWithDNS } = await import('./agent/ssrf');
       const check = await validateBaseUrlWithDNS(body.base_url as string);
       if (!check.valid) {
@@ -762,85 +1095,131 @@ async function handleAIRoute(request: Request, url: URL, env: Env): Promise<Resp
 
   // POST /api/ai/models — proxy model list from user's LLM provider
   if (url.pathname === '/api/ai/models' && request.method === 'POST') {
-    const { base_url, api_key } = await request.json<{ base_url: string; api_key: string }>();
-
-    if (!base_url || !api_key) {
-      return Response.json({ error: 'Missing base_url or api_key' }, { status: 400 });
-    }
-
-    // SSRF validation
-    const { validateBaseUrlWithDNS } = await import('./agent/ssrf');
-    const check = await validateBaseUrlWithDNS(base_url);
-    if (!check.valid) {
-      return Response.json({ error: check.reason }, { status: 400 });
-    }
-
-    try {
-      let cleanBaseUrl = base_url.replace(/\/$/, '');
-      if (cleanBaseUrl.endsWith('/chat/completions')) {
-        cleanBaseUrl = cleanBaseUrl.slice(0, -'/chat/completions'.length);
-      }
-      const modelsUrl = `${cleanBaseUrl}/models`;
-
-      const res = await fetch(modelsUrl, {
-        redirect: 'manual', // Cloudflare Workers only supports 'follow' or 'manual'
-        headers: {
-          Authorization: `Bearer ${api_key}`,
-        },
-        signal: AbortSignal.timeout(10000),
-      });
-
-      if (res.status >= 300 && res.status < 400) {
-        return Response.json(
-          { error: 'SSRF Protection: Redirects are not allowed' },
-          { status: 403 }
-        );
-      }
-
-      if (!res.ok) {
-        if (res.status === 404) {
-          return Response.json({
-            models: [],
-            fallback: true,
-            reason: 'Provider does not support /models endpoint',
-          });
-        }
-        if (res.status === 401 || res.status === 403) {
-          return Response.json(
-            { error: 'API Key invalid or insufficient permissions' },
-            { status: res.status }
-          );
-        }
-        return Response.json({ error: `Provider returned ${res.status}` }, { status: 502 });
-      }
-
-      const data = (await res.json()) as any;
-
-      let rawModels: any[] = [];
-      if (Array.isArray(data)) {
-        rawModels = data;
-      } else if (data && Array.isArray(data.data)) {
-        rawModels = data.data;
-      } else if (data && Array.isArray(data.models)) {
-        rawModels = data.models;
-      }
-
-      const models: Array<{ id: string }> = rawModels
-        .filter((m: any) => {
-          const id = m.id || '';
-          return !/embedding|whisper|tts|dall-e|moderation|rerank/i.test(id);
-        })
-        .map((m: any) => ({ id: m.id }))
-        .sort((a: any, b: any) => a.id.localeCompare(b.id));
-
-      return Response.json({ models, fallback: false });
-    } catch (e) {
-      const errMsg = e instanceof Error ? e.message : String(e);
-      return Response.json({ models: [], fallback: true, reason: errMsg });
-    }
+    return handleAIModelsProxy(request, user.id, stub);
   }
 
   return Response.json({ error: 'Method not allowed' }, { status: 405 });
+}
+
+async function handleAIModelsProxy(
+  request: Request,
+  userId: number,
+  stub: DurableObjectStub
+): Promise<Response> {
+  const { base_url, api_key } = await request.json<{ base_url?: string; api_key?: string }>();
+
+  let effectiveBaseUrl = base_url?.trim() || '';
+  let effectiveApiKey = api_key?.trim() || '';
+
+  // 若未显式传入 api_key，尝试从已保存配置中安全读取
+  if (!effectiveApiKey) {
+    const savedRes = await stub.fetch(
+      new Request(`http://internal/internal/ai-config/decrypt?user_id=${userId}`)
+    );
+    if (savedRes.ok) {
+      const saved = (await savedRes.json()) as { base_url?: string; api_key?: string };
+      const savedBaseUrl = saved.base_url?.trim() || '';
+      const savedApiKey = saved.api_key?.trim() || '';
+
+      // 若请求未传 base_url，则采用已保存的 base_url
+      if (!effectiveBaseUrl && savedBaseUrl) {
+        effectiveBaseUrl = savedBaseUrl;
+      }
+
+      // 核心安全防护（防凭据外带 Credential Exfiltration）：
+      // 使用已存凭证时，请求的 base_url 必须与已保存并绑定的 base_url 一致。
+      // 严禁将用户针对某一服务商的密钥发送至未经授权的第三方新地址！
+      if (effectiveBaseUrl && savedBaseUrl && isSameBaseUrl(effectiveBaseUrl, savedBaseUrl)) {
+        effectiveApiKey = savedApiKey;
+      } else if (effectiveBaseUrl && savedBaseUrl && !isSameBaseUrl(effectiveBaseUrl, savedBaseUrl)) {
+        return Response.json(
+          { error: '接口地址与已保存配置不一致，请提供对应的 API 密钥' },
+          { status: 400 }
+        );
+      }
+    }
+  }
+
+  if (!effectiveBaseUrl || !effectiveApiKey) {
+    return Response.json({ error: 'Missing base_url or api_key' }, { status: 400 });
+  }
+
+  try {
+    effectiveBaseUrl = normalizeAIBaseUrl(effectiveBaseUrl);
+  } catch {
+    return Response.json({ error: 'Invalid Responses API address', code: 'responses_address' }, { status: 400 });
+  }
+
+  // SSRF validation
+  const { validateBaseUrlWithDNS } = await import('./agent/ssrf');
+  const check = await validateBaseUrlWithDNS(effectiveBaseUrl);
+  if (!check.valid) {
+    return Response.json({ error: check.reason }, { status: 400 });
+  }
+
+  try {
+    const modelsUrl = `${effectiveBaseUrl}/models`;
+
+    const res = await fetch(modelsUrl, {
+      redirect: 'manual', // Cloudflare Workers only supports 'follow' or 'manual'
+      headers: {
+        Authorization: `Bearer ${effectiveApiKey}`,
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (res.status >= 300 && res.status < 400) {
+      return Response.json(
+        { error: 'SSRF Protection: Redirects are not allowed' },
+        { status: 403 }
+      );
+    }
+
+    if (!res.ok) {
+      if (res.status === 404) {
+        return Response.json({
+          models: [],
+          fallback: true,
+          reason: 'Provider does not support /models endpoint',
+        });
+      }
+      if (res.status === 401 || res.status === 403) {
+        return Response.json(
+          { error: 'API Key invalid or insufficient permissions' },
+          { status: res.status }
+        );
+      }
+      return Response.json({ error: `Provider returned ${res.status}` }, { status: 502 });
+    }
+
+    const data = (await res.json()) as any;
+
+    let rawModels: any[] = [];
+    if (Array.isArray(data)) {
+      rawModels = data;
+    } else if (data && Array.isArray(data.data)) {
+      rawModels = data.data;
+    } else if (data && Array.isArray(data.models)) {
+      rawModels = data.models;
+    }
+
+    const models = rawModels
+      .filter((m: any) => {
+        const id = m.id || '';
+        return !/embedding|whisper|tts|dall-e|moderation|rerank/i.test(id);
+      })
+      .map((m: any) => ({ id: m.id, ...readProviderModelLimits(m) }))
+      .sort((a: { id: string }, b: { id: string }) => a.id.localeCompare(b.id));
+
+    return Response.json({ models, fallback: false });
+  } catch (e) {
+    const errMsg = e instanceof Error ? e.message : String(e);
+    return Response.json({
+      models: [],
+      fallback: true,
+      reason: sanitizeAIErrorMessage(errMsg, effectiveApiKey),
+    });
+  }
 }
 
 // ==================== SSH connection handlers ====================
@@ -871,8 +1250,9 @@ async function handleSSHConnection(request: Request, env: Env): Promise<Response
     return new Response('Forbidden', { status: 403 });
   }
 
-  if (isGitHubAuthRequired(env) && !(await getAuthenticatedUser(request, env))) {
-    return Response.json({ error: 'GitHub authentication required' }, { status: 401 });
+  if ((isGitHubAuthRequired(env) || resolveAuthMode(env, request) === 'cf_access') &&
+      !(await getAuthenticatedUser(request, env))) {
+    return Response.json({ error: 'Authentication required' }, { status: 401 });
   }
 
   const sessionName = `session:${Date.now()}:${crypto.randomUUID()}`;
@@ -891,6 +1271,7 @@ async function handleSSHConnection(request: Request, env: Env): Promise<Response
   const headers = new Headers(request.headers);
   headers.set('x-cloudflare-colo', (request as any).cf?.colo || 'UNKNOWN');
   headers.delete('x-ssh-config'); // 防御：禁止匿名连接通过 HTTP 头注入配置
+  headers.delete('x-share-device-key');
 
   return stub.fetch(new Request(doUrl.toString(), { headers }));
 }
@@ -912,11 +1293,15 @@ async function handleResumeSSHConnection(
     return new Response('Forbidden', { status: 403 });
   }
 
-  // 与 direct / one-time-token 升级路径保持一致的强制 GitHub 登录门禁：
-  // REQUIRE_GITHUB_AUTH=true 时 resume 凭据不能替代有效会话。
-  if (isGitHubAuthRequired(env) && !(await getAuthenticatedUser(request, env))) {
-    return Response.json({ error: 'GitHub authentication required' }, { status: 401 });
+  const accessMode = resolveAuthMode(env, request) === 'cf_access';
+  const loginRequired = isGitHubAuthRequired(env) || accessMode;
+  const authenticated = loginRequired ? await getAuthenticatedUser(request, env) : null;
+  // Access lookup failures remain fail-closed. A public share recipient, however,
+  // may resume only a device-bound share; the DO checks its actual stored policy.
+  if (accessMode && !authenticated) {
+    return Response.json({ error: 'Authentication required' }, { status: 401 });
   }
+  const shareResumeOnly = loginRequired && !authenticated;
 
   const doId = env.SSH_SESSION.idFromName(sessionName);
   const stub = env.SSH_SESSION.get(doId);
@@ -929,6 +1314,9 @@ async function handleResumeSSHConnection(
   const headers = new Headers(request.headers);
   headers.set('x-cloudflare-colo', (request as any).cf?.colo || 'UNKNOWN');
   headers.delete('x-ssh-config');
+  headers.delete('x-share-device-key');
+  headers.delete('x-ssh-share-resume-only');
+  if (shareResumeOnly) headers.set('x-ssh-share-resume-only', 'true');
 
   return stub.fetch(new Request(doUrl.toString(), { headers }));
 }
@@ -991,7 +1379,7 @@ async function handleShareOwnerRoute(request: Request, url: URL, env: Env): Prom
   const match = url.pathname.match(/^\/api\/shares\/([^/]+)(?:\/audit)?$/);
   if (!match) return new Response('Not Found', { status: 404 });
   const shareId = decodeURIComponent(match[1]);
-  const ownerStub = getUserDBStub(env, user.github_id);
+  const ownerStub = getUserDBStub(env, await userDbRouteKey(user));
   const metadataResponse = await ownerStub.fetch(
     new Request(
       `http://internal/internal/shares/${encodeURIComponent(shareId)}?user_id=${user.id}`,
@@ -1064,7 +1452,8 @@ async function handleShareSSHConnection(
   if (!config.sessionPolicy || config.sessionPolicy.shareRef !== shareRef) {
     return Response.json({ error: 'Invalid share session policy' }, { status: 500 });
   }
-  if (!isGitHubUserAllowed(env, config.githubId ?? '')) {
+  // 本地管理员（密码模式）拥有的分享不受 GitHub 白名单约束
+  if (!isSshIdentityAllowed(env, config.githubId)) {
     return Response.json({ error: 'Share owner is no longer allowed' }, { status: 403 });
   }
 
@@ -1081,8 +1470,9 @@ async function handleShareSSHConnection(
   const headers = new Headers(request.headers);
   headers.set('x-cloudflare-colo', (request as any).cf?.colo || 'UNKNOWN');
   headers.set('x-ssh-config', encodeURIComponent(JSON.stringify(config)));
-  // 认领时绑定的设备公钥由服务端链路下发（claim → ShareDO → consume），
-  // 客户端无法注入或替换，断线恢复时以此验签。
+  // Clear the external header even when claim did not bind a device.
+  // Only claim → ShareDO → consume may supply the authoritative resume key.
+  headers.delete('x-share-device-key');
   if (typeof devicePubKey === 'string' && devicePubKey) {
     headers.set('x-share-device-key', devicePubKey);
   }
@@ -1111,18 +1501,26 @@ async function handleTokenSSHConnection(
     return new Response('Forbidden', { status: 403 });
   }
 
-  const githubAuthRequired = isGitHubAuthRequired(env);
-  const authenticatedUser = githubAuthRequired ? await getAuthenticatedUser(request, env) : null;
-  if (githubAuthRequired && !authenticatedUser) {
-    return Response.json({ error: 'GitHub authentication required' }, { status: 401 });
+  const authMode = resolveAuthMode(env, request);
+  const loginRequired = isGitHubAuthRequired(env) || authMode === 'cf_access';
+  const authenticatedUser = loginRequired ? await getAuthenticatedUser(request, env) : null;
+  if (loginRequired && !authenticatedUser) {
+    return Response.json({ error: 'Authentication required' }, { status: 401 });
   }
 
   // 从 UserDBDO 消费 token，获取连接配置
-  const [githubId] = token.split(':');
-  if (!githubId) {
+  const routeKey = connectTokenRouteKey(token);
+  if (!routeKey) {
     return Response.json({ error: 'Invalid token format' }, { status: 400 });
   }
-  const stub = getUserDBStub(env, githubId);
+  if (!isConnectTokenRouteAllowed(authMode, routeKey)) {
+    return Response.json({ error: 'Connection token was issued under a different auth mode' }, { status: 403 });
+  }
+  // Check ownership before consuming: another account must not invalidate this one-time token.
+  if (authenticatedUser && routeKey !== await userDbRouteKey(authenticatedUser)) {
+    return Response.json({ error: 'Connection token does not belong to this account' }, { status: 403 });
+  }
+  const stub = getUserDBStub(env, routeKey);
   const tokenRes = await stub.fetch(
     new Request('http://internal/internal/connect-token/consume', {
       method: 'POST',
@@ -1136,7 +1534,8 @@ async function handleTokenSSHConnection(
   }
 
   const config = await tokenRes.json<SSHConnectionConfig>();
-  if (!isGitHubUserAllowed(env, config.githubId ?? '')) {
+  // 本地管理员与 Access 哨兵不适用 GitHub 白名单；GitHub 用户照常校验
+  if (!isSshIdentityAllowed(env, config.githubId)) {
     return Response.json({ error: 'GitHub account is not allowed' }, { status: 403 });
   }
   if (authenticatedUser && String(authenticatedUser.github_id) !== String(config.githubId)) {
@@ -1164,6 +1563,7 @@ async function handleTokenSSHConnection(
   const headers = new Headers(request.headers);
   headers.set('x-cloudflare-colo', (request as any).cf?.colo || 'UNKNOWN');
   headers.set('x-ssh-config', encodeURIComponent(JSON.stringify(config)));
+  headers.delete('x-share-device-key');
 
   const doRequest = new Request(doUrl.toString(), {
     headers: headers,
@@ -1192,5 +1592,8 @@ async function handleSFTPAttachConnection(request: Request, env: Env): Promise<R
 
   const doId = env.SSH_SESSION.idFromName(sessionName);
   const stub = env.SSH_SESSION.get(doId);
-  return stub.fetch(request);
+  const headers = new Headers(request.headers);
+  headers.delete('x-share-device-key');
+  headers.delete('x-ssh-config');
+  return stub.fetch(new Request(request, { headers }));
 }

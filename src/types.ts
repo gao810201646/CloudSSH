@@ -46,8 +46,10 @@ export interface SSHConnectionConfig {
   port: number;
   username: string;
   password: string;
-  authMethod?: 'password' | 'publickey';
+  authMethod?: 'password' | 'publickey' | 'none';
   privateKey?: string;
+  /** 可选 OpenSSH 用户证书（单行文本或 Base64） */
+  certificate?: string;
   cols?: number;
   rows?: number;
   expectedFingerprint?: string;
@@ -55,6 +57,11 @@ export interface SSHConnectionConfig {
   knownHostIdentity?: string;
   userId?: string;
   githubId?: string;
+  /**
+   * UserDBDO 路由键。GitHub / 管理员与 githubId 相同；
+   * Access 用户是邮箱路由键，不能用哨兵 githubId `-2`。
+   */
+  userDbRouteKey?: string;
   /** 已保存服务器的记录 ID（token 路径下由 handleConnectServer 填充，供 OS 检测持久化） */
   serverId?: number;
   /** 已检测并持久化的操作系统标识（已设置则连接时跳过重复检测） */
@@ -71,6 +78,23 @@ export interface SSHConnectionConfig {
   jumpHosts?: SSHJumpHostConfig[];
   /** 仅可由 Worker 内部的一次性分享兑换流程写入，客户端输入必须剥离。 */
   sessionPolicy?: SSHSessionPolicy;
+  /**
+   * 传输协议类型：'direct'（直连 TCP / 跳板机）或 'cf_tunnel'（Cloudflare 隧道 WSS）
+   */
+  transportType?: 'direct' | 'cf_tunnel';
+  /**
+   * Cloudflare 隧道公共主机名（例如 ssh.example.com）。
+   * 仅在 transportType === 'cf_tunnel' 时生效。
+   */
+  cfTunnelHost?: string;
+  /**
+   * Cloudflare Zero Trust Access Service Token Client ID（可选）
+   */
+  cfAccessClientId?: string;
+  /**
+   * Cloudflare Zero Trust Access Service Token Client Secret（可选）
+   */
+  cfAccessClientSecret?: string;
 }
 
 export interface SSHSessionPolicy {
@@ -94,8 +118,10 @@ export interface SSHJumpHostConfig {
   port: number;
   username: string;
   password: string;
-  authMethod: 'password' | 'publickey';
+  authMethod: 'password' | 'publickey' | 'none';
   privateKey: string;
+  /** 可选 OpenSSH 用户证书 */
+  certificate?: string;
   expectedFingerprint?: string;
   knownHostIdentity: string;
 }
@@ -148,6 +174,8 @@ export function normalizeTerminalSize(cols: unknown, rows: unknown): TerminalSiz
 
 export interface Env {
   SSH_SESSION: DurableObjectNamespace;
+  /** Isolated, bounded personal MCP execution pools. Optional during staged deployment. */
+  MCP_EXECUTION?: DurableObjectNamespace;
   USER_DB: DurableObjectNamespace;
   SSH_SHARE: DurableObjectNamespace;
   MAX_CONNECTIONS?: string;
@@ -168,13 +196,33 @@ export interface Env {
   DEBUG_MODE?: string;
   // 一次性 SSH 分享（默认关闭；true 时登录用户可创建分享链接）
   ENABLE_SSH_SHARING?: string;
+  // 单管理员密码认证（可选）。
+  // 格式：pbkdf2$sha256$<iterations>$<salt-b64url>$<verifier-b64url>，由 `pnpm run hash-password` 生成。
+  // 非空且格式合法即启用密码模式：GitHub OAuth 路由禁用，全实例仅本地管理员一个账号。
+  // 置空/删除即刻退回 GitHub 模式；verifier = SHA-256(PBKDF2(password, salt, iterations))。
+  // 浏览器端执行 PBKDF2 预拉伸（server relief），Worker 侧仅做一次 SHA-256 比对（Free 套餐 CPU 安全）。
+  ADMIN_PASSWORD_HASH?: string;
+  // 强制 Cloudflare Access 模式（可选；运行时 ctx.access 自动感知，绝不信任原始身份标头）
+  CF_ACCESS?: string;
+  // Cloudflare Zero Trust Team 名称（可选；用于自动推断或预填 SSH CA 签发端点）
+  CF_ACCESS_TEAM_NAME?: string;
+}
+
+/** /api/config 下发的密码认证公开参数（盐与迭代数非机密，供浏览器预拉伸） */
+export interface PasswordAuthParams {
+  kdf: 'pbkdf2-sha256';
+  iterations: number;
+  salt: string; // base64url
 }
 
 export interface UserInfo {
   id: number;
   github_id: number;
   username: string;
-  avatar_url: string;
+  /** 本地管理员（密码模式）与 CF Access 用户无头像，恒为 null；GitHub 用户为头像 URL */
+  avatar_url: string | null;
+  /** Cloudflare Access 模式下的已验证邮箱 */
+  email?: string | null;
 }
 
 export interface ServerConfig {
@@ -184,7 +232,7 @@ export interface ServerConfig {
   host: string;
   port: number;
   username: string;
-  auth_method: 'password' | 'publickey';
+  auth_method: 'password' | 'publickey' | 'none';
   /** 用户手动指定的区域偏好；空表示 Auto（依赖系统推断的 inferred_hint） */
   region?: string | null;
   /** 系统在保存/更新服务器时通过第三方 IPinfo 自动推断并持久化的 hint */
@@ -195,9 +243,28 @@ export interface ServerConfig {
   os?: string | null;
   /** Optional saved server used as the immediate SSH jump host. */
   jump_server_id?: number | null;
+  /** 传输协议类型：直连 TCP ('direct') 或 Cloudflare 隧道 ('cf_tunnel')，默认为 'direct' */
+  transport_type?: 'direct' | 'cf_tunnel';
+  /** Cloudflare 隧道公共主机名（如 ssh.example.com） */
+  cf_tunnel_host?: string | null;
+  /** Cloudflare Zero Trust Access Service Token Client ID（可选） */
+  cf_access_client_id?: string | null;
+  /** 是否已保存 Cloudflare Zero Trust Access Service Token Secret */
+  has_cf_access_client_secret?: boolean;
+  /** Cloudflare Zero Trust SSH CA 团队标识（非空表示使用原生 SSH CA 短期证书认证） */
+  cf_ssh_ca_team?: string | null;
+  /** 最近连接成功的 Unix 毫秒时间戳 */
+  last_connected_at?: number | null;
   created_at: string;
   updated_at: string;
 }
+
+export type {
+  ServerWorkLog,
+  ServerKnowledgeItem,
+  UnifiedServerMemory,
+  KnowledgeCategory,
+} from './server-memory-schema';
 
 export const SSH_MSG_DISCONNECT = 1;
 export const SSH_MSG_IGNORE = 2;

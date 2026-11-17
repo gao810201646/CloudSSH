@@ -1,7 +1,11 @@
 import { AIConfigPanel } from './ai-config';
+import { openAdminHashGeneratorDialog } from './admin-hash-generator';
 import { ConnectionForm } from './auth-form';
+import { type AppConfig, type InitialUser, loadInitialAppState } from './app-bootstrap';
+import { clearLegacyAgentSessionDrafts, clearUserAgentSessionDrafts } from './agent/session-draft';
 import { initI18n, onLocaleChange, t } from './i18n';
 import { MobileTerminalController } from './mobile-terminal';
+import { MobileShortcutsManager } from './mobile-shortcuts-manager';
 import { ServerList } from './server-list';
 import {
   type ClaimedShare,
@@ -15,25 +19,45 @@ import type { SSHHostInfo, SSHTerminal } from './terminal';
 import {
   applyBuiltInTheme,
   applyImportedTheme,
+  type BuiltInThemeName,
   isBuiltInTheme,
   normalizeImportedTheme,
   THEME_MAX_BYTES,
 } from './theme';
+import { LiquidSegmentedThemeControl } from './theme-segmented';
+import { LiquidSegmentedDrawerControl } from './drawer-segmented';
+import { customThemeModal, customThemeStore } from './custom-theme-manager';
+import { requestCloudflareSshCertificate } from './cf-ssh-ca';
 import { notify } from './ui-feedback';
+import { initVersionNotice } from './version-notice';
+import { McpManager } from './mcp-manager';
+import { mountAssistantIcons } from './assistant-icons';
 
 // ==================== 全局状态 ====================
 
 let tabManager: TabManager | null = null;
 let connectionForm: ConnectionForm | null = null;
+let appConfig: AppConfig | null = null;
 let serverList: ServerList | null = null;
 let isLoggedIn = false;
+let currentGithubId: number | null = null;
 let sharedSessionMode = false;
+const mobileShortcutsManager = new MobileShortcutsManager();
 const mobileTerminalController = new MobileTerminalController(
-  () => tabManager?.getActiveTab()?.terminal ?? null
+  () => tabManager?.getActiveTab()?.terminal ?? null,
+  mobileShortcutsManager
 );
 const snippetManager = new SnippetManager({
   getTerminal: () => tabManager?.getActiveTab()?.terminal ?? null,
   isAuthenticated: () => isLoggedIn && !sharedSessionMode,
+  onStateChange: () => syncDrawerSegmentedControl(),
+});
+
+const mcpManager = new McpManager(() => {
+  if (!isLoggedIn || sharedSessionMode) return null;
+  const tab = tabManager?.getActiveTab();
+  const session = tab?.terminal.getMcpSession();
+  return tab && session ? { ...session, label: tab.label } : null;
 });
 
 function setUserSpaceMenuOpen(open: boolean): void {
@@ -81,7 +105,7 @@ function getTabManager(): TabManager {
     tabManager.setAllTabsClosedHandler(() => {
       showOfflineUI();
     });
-    tabManager.setLoggedIn(isLoggedIn);
+    tabManager.setUser(currentGithubId);
     // 连接后检测到操作系统 → 即时更新服务器列表卡片图标
     tabManager.setOSDetectedHandler((serverId, os) => {
       serverList?.updateServerOS(serverId, os);
@@ -98,10 +122,10 @@ function getTabManager(): TabManager {
         return;
       }
       try {
-        const ws = await requestSavedServerWebSocket(serverId);
+        const ws = await requestSavedServerWebSocket(serverId, tab.hostInfo?.cfSshCaTeam);
         const { terminal } = showTerminalWithNewTab(tab.label, tab.hostInfo);
         terminal.mount();
-        const reconnectFactory = () => requestSavedServerWebSocket(serverId);
+        const reconnectFactory = () => requestSavedServerWebSocket(serverId, tab.hostInfo?.cfSshCaTeam);
         terminal.connectWithWebSocket(ws, tab.hostInfo, { reconnectFactory });
       } catch (e) {
         notify(e instanceof Error ? e.message : String(e), { variant: 'danger' });
@@ -139,6 +163,9 @@ function activateTerminalView(): void {
   document.getElementById('terminal-section')!.classList.remove('hidden');
   document.getElementById('terminal-section')!.classList.add('flex');
   document.body.classList.add('terminal-active');
+  requestAnimationFrame(() => {
+    terminalDrawerControl?.refresh();
+  });
 }
 
 function showTerminalSection(): void {
@@ -215,6 +242,11 @@ function initTerminalTab(): void {
   document.getElementById('terminal-section')!.classList.add('flex');
   document.body.classList.add('terminal-active');
 
+  // 匿名模式直连：确保 AI Agent 入口隐藏
+  document.getElementById('agent-toggle-btn')?.classList.add('hidden');
+  document.getElementById('mobile-agent-btn')?.classList.add('hidden');
+  document.getElementById('mobile-shortcuts-terminal-btn')?.classList.add('hidden');
+
   // 隐藏标签栏（URL 直连模式只有一个标签，不需要标签栏）
   const tabBar = document.getElementById('tab-bar');
   if (tabBar) tabBar.style.display = 'none';
@@ -231,6 +263,7 @@ function initTerminalTab(): void {
 // ==================== 页面切换 ====================
 
 function deactivateTerminalView(): void {
+  closeAllDrawers();
   mobileTerminalController.leaveTerminal();
   document.getElementById('terminal-section')!.classList.add('hidden');
   document.getElementById('terminal-section')!.classList.remove('flex');
@@ -238,6 +271,8 @@ function deactivateTerminalView(): void {
 }
 
 function showAuthSection(): void {
+  mcpManager.setIdentity(null);
+  if (!appConfig) return;
   deactivateTerminalView();
   document.getElementById('auth-section')!.classList.remove('hidden');
   document.getElementById('user-space-section')!.classList.add('hidden');
@@ -245,50 +280,70 @@ function showAuthSection(): void {
   document.getElementById('server-modal')!.classList.add('hidden');
   document.getElementById('server-modal')!.classList.remove('flex');
 
+  // 匿名模式/退出登录：隐藏 AI Agent 按钮（桌面分段条与移动端菜单）
+  document.getElementById('agent-toggle-btn')?.classList.add('hidden');
+  document.getElementById('mobile-agent-btn')?.classList.add('hidden');
+  document.getElementById('mobile-shortcuts-terminal-btn')?.classList.add('hidden');
+  mobileShortcutsManager.setLoggedIn(false);
+
   if (!connectionForm) {
     connectionForm = new ConnectionForm({
+      config: appConfig,
       getTabManager,
     });
   }
   syncConnectionBackButtons();
 }
 
-function showUserSpace(user: {
-  id: number;
-  github_id: number;
-  username: string;
-  avatar_url: string;
-}): void {
+function showUserSpace(user: InitialUser, config: AppConfig): void {
   deactivateTerminalView();
+  mcpManager.setIdentity(`${user.github_id}:${user.username}`, config.authMode);
+  const previousGithubId = currentGithubId;
   isLoggedIn = true;
+  currentGithubId = user.github_id;
+  tabManager?.setUser(currentGithubId);
+  if (previousGithubId !== null && previousGithubId !== currentGithubId) {
+    clearUserAgentSessionDrafts(previousGithubId);
+  }
+  customThemeStore.setLoggedIn(true);
   document.getElementById('auth-section')!.classList.add('hidden');
   document.getElementById('user-space-section')!.classList.remove('hidden');
   document.getElementById('user-space-section')!.classList.add('flex');
+  requestAnimationFrame(() => {
+    userThemeSegmentedControl?.refresh();
+  });
 
   // Show agent toggle button for logged-in users
   document.getElementById('agent-toggle-btn')?.classList.remove('hidden');
+  document.getElementById('mobile-agent-btn')?.classList.remove('hidden');
+  document.getElementById('mobile-shortcuts-terminal-btn')?.classList.remove('hidden');
+  mobileShortcutsManager.setLoggedIn(true);
 
   serverList = new ServerList(
     user,
     // onLogout 回调
     () => {
       isLoggedIn = false;
+      currentGithubId = null;
+      customThemeStore.setLoggedIn(false);
       serverList = null;
-      if (tabManager) {
-        tabManager.closeAllTabs();
-      }
+      tabManager?.setUser(null);
+      // Dispose panels before clearing storage so late frames cannot recreate drafts.
+      clearUserAgentSessionDrafts(user.github_id);
+      clearLegacyAgentSessionDrafts();
       showAuthSection();
     },
     // onConnect 回调 — 在当前页面创建新标签
     (wsUrl: string, serverName: string, hostInfo?: SSHHostInfo) => {
       showTerminalFromServer(wsUrl, serverName, hostInfo);
-    }
+    },
+    config
   );
 }
 
 /** 显示连接页面（匿名 → auth-form，登录 → 服务器列表） */
 function showConnectionPage(): void {
-  tabManager?.getActiveTab()?.agentPanel?.rejectPendingConfirmation(false);
+  closeAllDrawers();
 
   // 如果还有活跃标签，不需要隐藏终端区域；只需要覆盖显示连接页面
   // 但为了简单起见，我们先切回对应的入口页面
@@ -296,6 +351,10 @@ function showConnectionPage(): void {
     deactivateTerminalView();
     document.getElementById('user-space-section')!.classList.remove('hidden');
     document.getElementById('user-space-section')!.classList.add('flex');
+    requestAnimationFrame(() => {
+      userThemeSegmentedControl?.refresh();
+    });
+    void serverList?.refresh();
   } else {
     showAuthSection();
   }
@@ -324,6 +383,7 @@ function showOfflineUI(): void {
   if (isLoggedIn) {
     document.getElementById('user-space-section')?.classList.remove('hidden');
     document.getElementById('user-space-section')?.classList.add('flex');
+    void serverList?.refresh();
   } else {
     showAuthSection();
   }
@@ -341,10 +401,12 @@ function showTerminalWithNewTab(
   displayLabel: string,
   hostInfo?: SSHHostInfo
 ): { tab: ReturnType<TabManager['createTab']>; terminal: SSHTerminal } {
+  closeAllDrawers();
   activateTerminalView();
 
   const tm = getTabManager();
   const tab = tm.createTab(displayLabel, hostInfo);
+  document.getElementById('mobile-shortcuts-terminal-btn')?.classList.toggle('hidden', !isLoggedIn || sharedSessionMode);
 
   return { tab, terminal: tab.terminal };
 }
@@ -366,7 +428,9 @@ function showTerminalFromServer(wsUrl: string, serverName: string, hostInfo?: SS
   const ws = new WebSocket(wsUrl);
   ws.binaryType = 'arraybuffer';
   const serverId = hostInfo?.serverId;
-  const reconnectFactory = serverId ? () => requestSavedServerWebSocket(serverId) : undefined;
+  const reconnectFactory = serverId
+    ? () => requestSavedServerWebSocket(serverId, hostInfo?.cfSshCaTeam)
+    : undefined;
   terminal.connectWithWebSocket(ws, hostInfo, { reconnectFactory });
 }
 
@@ -378,6 +442,8 @@ function showSharedTerminal(claim: ClaimedShare): void {
   sharedSessionMode = true;
   isLoggedIn = false;
   document.getElementById('agent-toggle-btn')?.classList.add('hidden');
+  document.getElementById('mobile-agent-btn')?.classList.add('hidden');
+  document.getElementById('mobile-shortcuts-terminal-btn')?.classList.add('hidden');
   document.getElementById('snippet-toggle-btn')?.classList.add('hidden');
   document.getElementById('mobile-snippets-btn')?.classList.add('hidden');
   const tabBar = document.getElementById('tab-bar');
@@ -391,8 +457,21 @@ function showSharedTerminal(claim: ClaimedShare): void {
   terminal.connectWithWebSocket(socket, undefined, { resumeOnly: true });
 }
 
-async function requestSavedServerWebSocket(serverId: number): Promise<WebSocket> {
-  const response = await fetch(`/api/servers/${serverId}/connect`, { method: 'POST' });
+async function requestSavedServerWebSocket(
+  serverId: number,
+  cfSshCaTeam?: string | null
+): Promise<WebSocket> {
+  let ephemeralCredential: string | undefined;
+  if (cfSshCaTeam) {
+    const creds = await requestCloudflareSshCertificate(cfSshCaTeam);
+    ephemeralCredential = `${creds.privateKey}\n${creds.certificate}`;
+  }
+
+  const response = await fetch(`/api/servers/${serverId}/connect`, {
+    method: 'POST',
+    headers: ephemeralCredential ? { 'Content-Type': 'application/json' } : undefined,
+    body: ephemeralCredential ? JSON.stringify({ ephemeralCredential }) : undefined,
+  });
   if (!response.ok) {
     const contentType = response.headers.get('content-type') || '';
     const message = contentType.includes('application/json')
@@ -424,30 +503,115 @@ document.getElementById('disconnect-btn')?.addEventListener('click', () => {
   tm.closeActiveTab();
 });
 
-// ==================== 命令片段库 ====================
+// ==================== 抽屉分段控制条与互斥联动 ====================
 
-function toggleSnippetManager(): void {
-  snippetManager.toggle();
+let terminalDrawerControl: LiquidSegmentedDrawerControl | null = null;
+
+/** 收起所有标签页与全局抽屉（SFTP、Agent、命令片段）并重置顶栏抽屉分段条状态 */
+function closeAllDrawers(): void {
+  tabManager?.closeAllDrawers();
+  snippetManager.close();
+  syncDrawerSegmentedControl();
 }
 
-document.getElementById('snippet-toggle-btn')?.addEventListener('click', toggleSnippetManager);
+function syncDrawerSegmentedControl(): void {
+  const tab = tabManager?.getActiveTab();
+  if (snippetManager.isOpen()) {
+    terminalDrawerControl?.setActive('snippet');
+  } else if (tab?.sftpPanel?.isVisible()) {
+    terminalDrawerControl?.setActive('sftp');
+  } else if (tab?.agentPanel?.isOpen) {
+    terminalDrawerControl?.setActive('agent');
+  } else {
+    terminalDrawerControl?.setActive(null);
+  }
+}
+
+/**
+ * 抽屉互斥开关的唯一入口（桌面分段条与移动端菜单按钮共用）。
+ * 返回是否真的发生了状态变化（SFTP 未就绪 / Agent 不可用时为 false）。
+ */
+function applyDrawerToggle(drawer: 'sftp' | 'snippet' | 'agent', open: boolean): boolean {
+  const tab = tabManager?.getActiveTab();
+  if (drawer === 'sftp') {
+    if (open) {
+      // SFTP 面板由 TabManager 的 sessionReady 回调初始化，未就绪时不可打开
+      if (!tab?.sftpPanel) return false;
+      snippetManager.close();
+      tab.agentPanel?.hide();
+      tab.sftpPanel.show();
+    } else {
+      tab?.sftpPanel?.hide();
+    }
+  } else if (drawer === 'snippet') {
+    if (open) {
+      tab?.sftpPanel?.hide();
+      tab?.agentPanel?.hide();
+      void snippetManager.open();
+    } else {
+      snippetManager.close();
+    }
+  } else {
+    if (open) {
+      if (!tab?.agentPanel) return false;
+      tab.sftpPanel?.hide();
+      snippetManager.close();
+      tab.agentPanel.show();
+    } else {
+      tab?.agentPanel?.hide();
+    }
+  }
+  syncDrawerSegmentedControl();
+  return true;
+}
+
+function initTerminalDrawerControl(): void {
+  const drawerBar = document.getElementById('terminal-drawer-segmented-bar');
+  if (!drawerBar) return;
+
+  terminalDrawerControl = new LiquidSegmentedDrawerControl(drawerBar, (drawer, open) => {
+    if (!applyDrawerToggle(drawer as 'sftp' | 'snippet' | 'agent', open)) {
+      // 抽屉不可用：回退透镜的激活态
+      terminalDrawerControl?.setActive(null);
+    }
+  });
+}
+
+/**
+ * 移动端抽屉入口（#mobile-more-menu 内的 SFTP / AI Agent）。
+ * 分段切换器在移动端整体隐藏（.desktop-terminal-action），因此这两个抽屉
+ * 必须在移动端菜单里保留平行入口，否则移动端用户将无法使用 SFTP 与 AI 助手。
+ */
+function initMobileDrawerButtons(): void {
+  const closeMenu = () => mobileTerminalController.hideMoreMenu();
+
+  document.getElementById('mobile-sftp-btn')?.addEventListener('click', () => {
+    const tab = tabManager?.getActiveTab();
+    applyDrawerToggle('sftp', !(tab?.sftpPanel?.isVisible() ?? false));
+    closeMenu();
+  });
+
+  document.getElementById('mobile-agent-btn')?.addEventListener('click', () => {
+    const tab = tabManager?.getActiveTab();
+    applyDrawerToggle('agent', !(tab?.agentPanel?.isOpen ?? false));
+    closeMenu();
+  });
+}
+
+// 移动端命令片段按钮
+function toggleSnippetManager(): void {
+  const tab = tabManager?.getActiveTab();
+  if (!snippetManager.isOpen()) {
+    tab?.sftpPanel?.hide();
+    tab?.agentPanel?.hide();
+  }
+  snippetManager.toggle();
+  syncDrawerSegmentedControl();
+}
+
 document.getElementById('mobile-snippets-btn')?.addEventListener('click', toggleSnippetManager);
 
-// ==================== SFTP 面板 ====================
-
-document.getElementById('sftp-toggle-btn')?.addEventListener('click', () => {
-  const tab = tabManager?.getActiveTab();
-  if (!tab) return;
-
-  if (!tab.sftpPanel) {
-    // SFTP 面板由 TabManager 的 sessionReady 回调初始化
-    // 如果还没有初始化，说明 SSH 还没就绪
-    return;
-  }
-  tab.sftpPanel.toggle();
-});
-
-// ==================== AI Agent 面板 ====================
+// ==================== AI Agent 面板设置 ====================
 
 const aiConfigPanel = new AIConfigPanel();
 
@@ -455,10 +619,8 @@ document.getElementById('ai-config-btn')?.addEventListener('click', () => {
   aiConfigPanel.show();
 });
 
-document.getElementById('agent-toggle-btn')?.addEventListener('click', () => {
-  const tab = tabManager?.getActiveTab();
-  if (!tab?.agentPanel) return;
-  tab.agentPanel.toggle();
+document.getElementById('mobile-shortcuts-config-btn')?.addEventListener('click', () => {
+  mobileShortcutsManager.showModal();
 });
 
 const askAISelectionButton = document.getElementById('ask-ai-selection-btn');
@@ -486,29 +648,51 @@ document.getElementById('export-btn')?.addEventListener('click', () => {
 
 const CUSTOM_THEME_VALUE = '__custom__';
 let themeSelectionRevision = 0;
+let userThemeSegmentedControl: LiquidSegmentedThemeControl | null = null;
 const themeSelectors = Array.from(
   document.querySelectorAll<HTMLSelectElement>('[data-theme-selector]')
 );
 
+function handleThemeSelection(value: string): void {
+  if (value === CUSTOM_THEME_VALUE) {
+    if (!customThemeStore.hasThemes()) {
+      // 未上传过自定义主题 -> 弹窗要求上传
+      const fallback = localStorage.getItem('cloudssh_theme_selection') || 'cyberpunk';
+      syncThemeSelectors(fallback);
+      customThemeModal.show({
+        onApplied: () => {
+          themeSelectionRevision++;
+          syncThemeSelectors(CUSTOM_THEME_VALUE);
+          localStorage.setItem('cloudssh_theme_selection', CUSTOM_THEME_VALUE);
+        },
+        onClosed: () => {
+          if (!customThemeStore.hasThemes()) {
+            const cur = localStorage.getItem('cloudssh_theme_selection') || 'cyberpunk';
+            syncThemeSelectors(cur);
+          }
+        },
+      });
+      return;
+    }
+
+    const active = customThemeStore.getActiveTheme();
+    if (active) {
+      applyImportedTheme(active.data);
+      localStorage.setItem('cloudssh_imported_theme', JSON.stringify(active.data));
+    }
+  } else if (isBuiltInTheme(value)) {
+    applyBuiltInTheme(value);
+  }
+
+  themeSelectionRevision++;
+  syncThemeSelectors(value);
+  localStorage.setItem('cloudssh_theme_selection', value);
+}
+
 for (const selector of themeSelectors) {
   selector.addEventListener('change', (e) => {
-    themeSelectionRevision++;
     const value = (e.target as HTMLSelectElement).value;
-    if (value === CUSTOM_THEME_VALUE) {
-      const importedRaw = localStorage.getItem('cloudssh_imported_theme');
-      if (importedRaw) {
-        try {
-          const imported = normalizeImportedTheme(JSON.parse(importedRaw));
-          if (imported) applyImportedTheme(imported);
-        } catch {
-          /* ignore */
-        }
-      }
-    } else if (isBuiltInTheme(value)) {
-      applyBuiltInTheme(value);
-    }
-    syncThemeSelectors(value);
-    localStorage.setItem('cloudssh_theme_selection', value);
+    handleThemeSelection(value);
   });
 }
 
@@ -522,72 +706,85 @@ function ensureCustomOption(): void {
     }
     option.textContent = t('theme.custom');
   }
+  userThemeSegmentedControl?.ensureCustomButton();
 }
 
 function syncThemeSelectors(value: string): void {
   for (const selector of themeSelectors) {
     selector.value = value;
   }
+  userThemeSegmentedControl?.syncFromSelect(value, true);
 }
 
-// ==================== 主题导入 ====================
-
-const importThemeButtons = document.querySelectorAll<HTMLElement>('[data-theme-import]');
-const importThemeInput = document.getElementById('import-theme-input') as HTMLInputElement | null;
-
-for (const button of importThemeButtons) {
-  button.addEventListener('click', () => importThemeInput?.click());
-}
-
-importThemeInput?.addEventListener('change', (e) => {
+// 兼容全局/测试文件导入 input
+const globalImportThemeInput = document.getElementById('import-theme-input') as HTMLInputElement | null;
+globalImportThemeInput?.addEventListener('change', async (e) => {
   const file = (e.target as HTMLInputElement).files?.[0];
   if (!file) return;
   if (file.size > THEME_MAX_BYTES) {
     notify(t('theme.importFailed'), { title: t('theme.importTitle'), variant: 'danger' });
-    importThemeInput.value = '';
+    globalImportThemeInput.value = '';
     return;
   }
 
-  const reader = new FileReader();
-  reader.onload = async (ev) => {
+  try {
+    const text = await file.text();
+    let rawJson: unknown;
     try {
-      const data = normalizeImportedTheme(JSON.parse(ev.target!.result as string));
-      if (!data) {
-        notify(t('theme.importFailed'), { title: t('theme.importTitle'), variant: 'danger' });
-        return;
-      }
-
-      localStorage.setItem('cloudssh_imported_theme', JSON.stringify(data));
-      themeSelectionRevision++;
-      ensureCustomOption();
-      syncThemeSelectors(CUSTOM_THEME_VALUE);
-      localStorage.setItem('cloudssh_theme_selection', CUSTOM_THEME_VALUE);
-
-      applyImportedTheme(data);
-      notify(t('theme.importSuccess'), { variant: 'success' });
-      if (isLoggedIn && !(await saveThemeToCloud(data))) {
-        notify(t('theme.syncFailed'), { title: t('feedback.warning'), variant: 'warning' });
-      }
+      rawJson = JSON.parse(text);
     } catch {
       notify(t('theme.invalidJson'), { title: t('theme.importTitle'), variant: 'danger' });
+      return;
     }
-  };
-  reader.readAsText(file);
-  importThemeInput.value = '';
+
+    const data = normalizeImportedTheme(rawJson);
+    if (!data) {
+      notify(t('theme.importFailed'), { title: t('theme.importTitle'), variant: 'danger' });
+      return;
+    }
+
+    const baseFileName = file.name.replace(/\.[^/.]+$/, '').trim();
+    const themeName = data.name || baseFileName || t('theme.custom');
+    const newItem = await customThemeStore.addTheme(themeName, data);
+    await customThemeStore.selectTheme(newItem.id);
+    handleThemeSelection(CUSTOM_THEME_VALUE);
+    notify(t('theme.importSuccess'), { variant: 'success' });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : t('theme.importFailed');
+    notify(msg, { title: t('theme.importTitle'), variant: 'danger' });
+  }
+  globalImportThemeInput.value = '';
+});
+
+// 监听自定义主题仓库变动：若全部主题被删除且当前处于自定义主题，自动回退到内置主题
+customThemeStore.subscribe(() => {
+  const current = localStorage.getItem('cloudssh_theme_selection');
+  if (current === CUSTOM_THEME_VALUE && !customThemeStore.hasThemes()) {
+    handleThemeSelection('cyberpunk');
+  }
 });
 
 // ==================== 主题恢复 ====================
+
+const LEGACY_THEME_MIGRATION: Record<string, BuiltInThemeName> = {
+  glacier: 'standard-dark',
+  apple: 'liquid-glass',
+  gruvbox: 'standard-dark',
+  crt: 'cyberpunk',
+  glass: 'liquid-glass',
+};
 
 /** 恢复主题（在 init 时调用，此时还没有终端实例，只设置 UI 变量） */
 function restoreTheme(): void {
   const selection = localStorage.getItem('cloudssh_theme_selection');
   localStorage.removeItem('cloudssh_theme');
 
-  // glacier 内置主题已被 Apple 主题取代：旧选择一次性迁移到同为深色的 Standard Dark
-  if (selection === 'glacier') {
-    localStorage.setItem('cloudssh_theme_selection', 'standard-dark');
-    applyBuiltInTheme('standard-dark');
-    syncThemeSelectors('standard-dark');
+  // 旧版内置主题平滑迁移到当前最契合的内置主题
+  if (selection && selection in LEGACY_THEME_MIGRATION) {
+    const migrated = LEGACY_THEME_MIGRATION[selection];
+    localStorage.setItem('cloudssh_theme_selection', migrated);
+    applyBuiltInTheme(migrated);
+    syncThemeSelectors(migrated);
     return;
   }
 
@@ -595,6 +792,17 @@ function restoreTheme(): void {
     applyBuiltInTheme(selection);
     syncThemeSelectors(selection);
     return;
+  }
+
+  if (selection === CUSTOM_THEME_VALUE && customThemeStore.hasThemes()) {
+    const active = customThemeStore.getActiveTheme();
+    if (active) {
+      applyImportedTheme(active.data);
+      localStorage.setItem('cloudssh_imported_theme', JSON.stringify(active.data));
+      ensureCustomOption();
+      syncThemeSelectors(CUSTOM_THEME_VALUE);
+      return;
+    }
   }
 
   const raw = localStorage.getItem('cloudssh_imported_theme');
@@ -635,6 +843,25 @@ async function saveThemeToCloud(
   }
 }
 
+/** 登录态下回归内置主题时删除云端自定义主题槽（幂等：无行也成功） */
+export async function clearCloudTheme(): Promise<boolean> {
+  try {
+    const response = await fetch('/api/user/theme', { method: 'DELETE' });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** 清除本地自定义主题缓存并从选择器移除自定义项（不影响当前生效的内置主题） */
+export function removeCustomThemeLocally(): void {
+  localStorage.removeItem('cloudssh_imported_theme');
+  for (const selector of themeSelectors) {
+    selector.querySelector(`option[value="${CUSTOM_THEME_VALUE}"]`)?.remove();
+  }
+  userThemeSegmentedControl?.removeCustomButton();
+}
+
 /**
  * 登录后恢复账号主题。新浏览器没有本地选择时自动启用云端主题；
  * 已明确选择内置主题的当前浏览器只缓存云端主题，不强制覆盖本地选择。
@@ -644,13 +871,30 @@ async function restoreCloudTheme(
   expectedSelectionRevision: number
 ): Promise<void> {
   try {
+    const ok = await customThemeStore.fetchFromCloud();
+    if (ok) {
+      if (themeSelectionRevision !== expectedSelectionRevision) return;
+      const active = customThemeStore.getActiveTheme();
+      if (active) {
+        localStorage.setItem('cloudssh_imported_theme', JSON.stringify(active.data));
+      }
+      ensureCustomOption();
+      if (initialSelection === null || initialSelection === CUSTOM_THEME_VALUE) {
+        localStorage.setItem('cloudssh_theme_selection', CUSTOM_THEME_VALUE);
+        if (active) {
+          applyImportedTheme(active.data);
+        }
+        syncThemeSelectors(CUSTOM_THEME_VALUE);
+      }
+      return;
+    }
+
     const response = await fetch('/api/user/theme');
     if (!response.ok) return;
     const payload = (await response.json()) as { theme?: unknown };
     const cloudTheme = normalizeImportedTheme(payload.theme);
 
     if (cloudTheme) {
-      // 用户已在请求期间切换或导入主题时，不用较旧的云端响应覆盖当前操作。
       if (themeSelectionRevision !== expectedSelectionRevision) return;
       localStorage.setItem('cloudssh_imported_theme', JSON.stringify(cloudTheme));
       ensureCustomOption();
@@ -662,7 +906,15 @@ async function restoreCloudTheme(
       return;
     }
 
-    // 匿名状态下已导入的本地主题，在首次登录后补充同步到账号。
+    // 匿名状态下已导入且当前正在使用的本地主题，在首次登录后补充同步到账号。
+    // 仅当本地选择停留在自定义主题时回填：排除「残留但未使用」的陈旧导入被上传到
+    // 全新账号的云端主题槽（如密码模式新建管理员搭配既有浏览器状态）。
+    const selection = localStorage.getItem('cloudssh_theme_selection');
+    if (selection !== CUSTOM_THEME_VALUE) return;
+    if (customThemeStore.hasThemes()) {
+      await customThemeStore.syncToCloud();
+      return;
+    }
     const localRaw = localStorage.getItem('cloudssh_imported_theme');
     if (!localRaw) return;
     const localTheme = normalizeImportedTheme(JSON.parse(localRaw));
@@ -674,11 +926,137 @@ async function restoreCloudTheme(
 
 // ==================== 初始化 ====================
 
+/**
+ * 卡片指针聚光追踪（全主题通用）：
+ * 监听 pointermove 并通过 requestAnimationFrame 节流更新 --mx 和 --my，
+ * 纯变量传导，零 DOM 重排，GPU 仅更新 radial-gradient 聚光位置。
+ * 触屏设备无悬停语义（CSS 侧同步隐藏聚光层），直接不注册以省电。
+ */
+function initPointerSpecularTracking(): void {
+  if (window.matchMedia?.('(hover: none) and (pointer: coarse)').matches) return;
+
+  let rafId: number | null = null;
+  let targetCard: HTMLElement | null = null;
+  let px = 50;
+  let py = 0;
+
+  document.addEventListener(
+    'pointermove',
+    (e: PointerEvent) => {
+      const card = (e.target as HTMLElement | null)?.closest?.(
+        '.server-card, .cyber-box, .sftp-entry'
+      ) as HTMLElement | null;
+      if (!card) {
+        targetCard = null;
+        return;
+      }
+      const rect = card.getBoundingClientRect();
+      targetCard = card;
+      px = Math.round(((e.clientX - rect.left) / rect.width) * 100);
+      py = Math.round(((e.clientY - rect.top) / rect.height) * 100);
+
+      if (rafId === null) {
+        rafId = requestAnimationFrame(() => {
+          if (targetCard) {
+            targetCard.style.setProperty('--mx', `${px}%`);
+            targetCard.style.setProperty('--my', `${py}%`);
+          }
+          rafId = null;
+        });
+      }
+    },
+    { passive: true }
+  );
+
+  document.addEventListener(
+    'pointerleave',
+    () => {
+      if (targetCard) {
+        targetCard.style.setProperty('--mx', '50%');
+        targetCard.style.setProperty('--my', '0%');
+        targetCard = null;
+      }
+    },
+    { passive: true }
+  );
+}
+
+/** #password-setup 路由消费：命中则打开生成器并清地址栏（init 与 hashchange 共用） */
+function consumeAdminSetupRoute(): void {
+  if (window.location.hash !== '#password-setup') return;
+  history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+  openAdminHashGeneratorDialog();
+}
+
+function finishAppLoading(): void {
+  const app = document.getElementById('app')!;
+  app.hidden = false;
+  app.removeAttribute('inert');
+  app.removeAttribute('aria-hidden');
+  document.getElementById('app-loading')?.remove();
+}
+
 async function init(): Promise<void> {
+  mountAssistantIcons();
+  clearLegacyAgentSessionDrafts();
   initI18n();
   initUserSpaceMobileMenu();
   initServerPaginationBreakpoints();
   bindBackToTerminalButtons();
+  initPointerSpecularTracking();
+  const userSegmentedContainer = document.getElementById('user-theme-segmented-container');
+  const userSelect = document.getElementById('user-theme-selector') as HTMLSelectElement | null;
+  if (userSegmentedContainer && userSelect) {
+    userThemeSegmentedControl = new LiquidSegmentedThemeControl(userSegmentedContainer, userSelect);
+    userThemeSegmentedControl.setOnCustomThemeClick((isCurrentlyActive) => {
+      if (!customThemeStore.hasThemes()) {
+        customThemeModal.show({
+          onApplied: () => {
+            themeSelectionRevision++;
+            userThemeSegmentedControl?.selectTheme(CUSTOM_THEME_VALUE);
+          },
+        });
+        return;
+      }
+
+      if (!isCurrentlyActive) {
+        userThemeSegmentedControl?.selectTheme(CUSTOM_THEME_VALUE);
+        return;
+      }
+
+      customThemeModal.show({
+        onApplied: () => {
+          themeSelectionRevision++;
+          userThemeSegmentedControl?.selectTheme(CUSTOM_THEME_VALUE);
+        },
+      });
+    });
+  }
+
+  const drawerBar = document.getElementById('terminal-drawer-segmented-bar');
+  if (drawerBar) {
+    initTerminalDrawerControl();
+  mcpManager.init();
+  }
+  initMobileDrawerButtons();
+
+  document.addEventListener('cloudssh:active-terminal-change', () => {
+    snippetManager.close();
+    syncDrawerSegmentedControl();
+  });
+
+  document.addEventListener('click', (e) => {
+    const target = e.target as HTMLElement | null;
+    if (target?.closest('#agent-close-btn, #sftp-close-btn, #snippet-close-btn')) {
+      setTimeout(() => syncDrawerSegmentedControl(), 50);
+    }
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      setTimeout(() => syncDrawerSegmentedControl(), 50);
+    }
+  });
   mobileTerminalController.start();
   onLocaleChange(() => {
     if (localStorage.getItem('cloudssh_imported_theme')) ensureCustomOption();
@@ -695,33 +1073,63 @@ async function init(): Promise<void> {
   const shareToken = takeShareTokenFromLocation();
   if (shareToken) {
     renderShareLanding(shareToken, showSharedTerminal);
+    finishAppLoading();
     return;
   }
+
+  // Optional metadata check is never awaited; share recipients do not need deployment hints.
+  initVersionNotice();
 
   // 独立终端标签页模式：URL 包含 wsUrl 参数
   if (isTerminalTab()) {
     initTerminalTab();
+    finishAppLoading();
     return;
   }
 
-  try {
-    // 检查是否已登录
-    const meRes = await fetch('/api/auth/me');
-    if (meRes.ok) {
-      const user = await meRes.json();
-      showUserSpace(user);
-      void restoreCloudTheme(initialThemeSelection, themeSelectionRevision);
-      return;
-    }
-  } catch {
-    // /api/auth/me 失败，继续显示匿名连接表单
-  }
+  // #password-setup：单管理员密码登录生成器直路由（全模式可用）。GitHub 模式
+  // 页脚不展示生成器入口（升级零感知），切换密码模式/轮换密码均经此 URL
+  // 进入（README 引导）。同时监听 hashchange：同页 hash 导航不触发重载，
+  // 用户在地址栏粘贴带 hash 的同页 URL 也能打开。
+  consumeAdminSetupRoute();
+  window.addEventListener('hashchange', consumeAdminSetupRoute);
 
-  // 未登录 → 显示匿名连接表单
-  showAuthSection();
+  const loadingStatus = document.getElementById('app-loading-status')!;
+  const loadingError = document.getElementById('app-loading-error')!;
+  const retryButton = document.getElementById('app-loading-retry') as HTMLButtonElement;
+  let loading = false;
+  const loadPage = async (): Promise<void> => {
+    if (loading) return;
+    loading = true;
+    retryButton.disabled = true;
+    loadingStatus.classList.remove('hidden');
+    loadingStatus.setAttribute('aria-busy', 'true');
+    loadingError.classList.add('hidden');
+    try {
+      const state = await loadInitialAppState();
+      appConfig = state.config;
+      if (state.user) {
+        showUserSpace(state.user, state.config);
+        void restoreCloudTheme(initialThemeSelection, themeSelectionRevision);
+      } else {
+        showAuthSection();
+      }
+      finishAppLoading();
+    } catch {
+      // Unknown configuration/authentication is not permission to show an anonymous form.
+      loadingStatus.classList.add('hidden');
+      loadingError.classList.remove('hidden');
+      retryButton.disabled = false;
+    } finally {
+      loadingStatus.setAttribute('aria-busy', 'false');
+      loading = false;
+    }
+  };
+  retryButton.addEventListener('click', () => void loadPage());
+  await loadPage();
 }
 
-// 导出供 auth-form 和 server-list 使用
-export { getTabManager, showTerminalWithNewTab, validateWsUrl };
+// 导出供 auth-form、server-list 和测试套件使用
+export { getTabManager, showTerminalWithNewTab, validateWsUrl, closeAllDrawers, showConnectionPage };
 
 init();

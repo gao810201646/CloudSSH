@@ -1,4 +1,69 @@
 <!doctype html>
+<!--
+Third-party notice: bcrypt-pbkdf 1.0.2 (also in docs/licenses/bcrypt-pbkdf.txt).
+The Blowfish portions are under the following license:
+
+Blowfish block cipher for OpenBSD
+Copyright 1997 Niels Provos <provos@physnet.uni-hamburg.de>
+All rights reserved.
+
+Implementation advice by David Mazieres <dm@lcs.mit.edu>.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+3. The name of the author may not be used to endorse or promote products
+   derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+The bcrypt_pbkdf portions are under the following license:
+
+Copyright (c) 2013 Ted Unangst <tedu@openbsd.org>
+
+Permission to use, copy, modify, and distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+Performance improvements (Javascript-specific):
+
+Copyright 2016, Joyent Inc
+Author: Alex Wilson <alex.wilson@joyent.com>
+
+Permission to use, copy, modify, and distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+-->
 <html class="dark" lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
@@ -9,14 +74,7 @@
     <meta name="color-scheme" content="dark light" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>CloudSSH</title>
-    <link
-      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap"
-      rel="stylesheet"
-    />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap"
-      rel="stylesheet"
-    />
+    <!-- 字体已本地化：见 frontend/src/assets/fonts/fonts.css 的 @font-face，不再请求 Google Fonts。 -->
     <link rel="stylesheet" href="/src/style.css" />
     <script
       src="https://challenges.cloudflare.com/turnstile/v0/api.js"
@@ -25,7 +83,37 @@
     ></script>
   </head>
   <body class="min-h-screen font-body text-sm">
-    <div id="app">
+    <div class="app-background" aria-hidden="true"></div>
+    <!-- 运行时配置与身份确认前，应用内容不可见、不可聚焦，也不进入无障碍树。 -->
+    <div id="app-loading" class="min-h-screen flex items-center justify-center p-6">
+      <main class="w-full max-w-md text-center" aria-label="CloudSSH">
+        <div class="text-3xl font-bold text-primary tracking-tighter mb-8">CloudSSH</div>
+        <div class="cyber-box p-6 min-h-[320px] flex items-center justify-center">
+          <div
+            id="app-loading-status"
+            class="space-y-5 text-muted"
+            role="status"
+            aria-live="polite"
+            aria-busy="true"
+          >
+            <span class="app-loading-spinner" aria-hidden="true"></span>
+            <p data-i18n="app.loading">正在加载配置与登录状态…</p>
+          </div>
+          <div id="app-loading-error" class="hidden space-y-5" role="alert">
+            <p class="text-muted" data-i18n="app.loadFailed">
+              暂时无法加载页面，请检查网络后重试。
+            </p>
+            <button
+              id="app-loading-retry"
+              type="button"
+              class="cyber-button text-primary px-5 py-2"
+              data-i18n="app.retry"
+            >重试</button>
+          </div>
+        </div>
+      </main>
+    </div>
+    <div id="app" hidden inert aria-hidden="true">
       <!-- Login Page (匿名连接) -->
       <div
         id="auth-section"
@@ -33,6 +121,7 @@
       >
         <div class="scanlines"></div>
         <div class="flicker"></div>
+        <div class="auth-aurora" aria-hidden="true"></div>
         <main class="w-full max-w-md relative z-10">
           <button
             id="back-to-terminal-from-auth-btn"
@@ -59,18 +148,21 @@
               class="theme-accent-line absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-[var(--accent)] to-transparent opacity-50"
             ></div>
             <div
-              class="flex items-center justify-between mb-8 pb-4 border-b border-dim"
+              class="auth-connection-header flex items-center justify-between mb-8 pb-4 border-b border-dim"
             >
-              <span
-                class="text-xs font-bold tracking-[0.1em] text-[var(--accent-secondary)]"
-                data-i18n="auth.connectionParameters"
-                >连接参数</span
-              >
-              <div class="flex items-center gap-3">
+              <div class="auth-connection-heading">
+                <span
+                  class="auth-connection-title text-xs font-bold tracking-[0.1em] text-[var(--accent-secondary)]"
+                  data-i18n="auth.connectionParameters"
+                  >连接参数</span
+                >
+                <div class="auth-version-notice" data-version-notice></div>
+              </div>
+              <div class="auth-connection-actions flex items-center">
                 <div data-language-switcher></div>
                 <span
                   class="material-symbols-outlined text-[var(--accent-secondary)]"
-                  style="font-variation-settings: &quot;FILL&quot; 0"
+                  style="font-variation-settings: 'FILL' 0"
                   >terminal</span
                 >
               </div>
@@ -114,6 +206,7 @@
             id="user-space-header-actions"
             class="user-space-header-actions flex items-center gap-4"
           >
+            <div id="user-theme-segmented-container" class="theme-segmented-wrapper"></div>
             <select
               id="user-theme-selector"
               data-theme-selector
@@ -124,45 +217,45 @@
               <option value="standard-dark">Standard Dark</option>
               <option value="standard-light">Standard Light</option>
               <option value="cyberpunk">Cyberpunk</option>
-              <option value="apple">Apple · Soft</option>
-              <option value="gruvbox">Gruvbox · Dense</option>
-              <option value="crt">CRT Amber</option>
-              <option value="glass">Glass · Soft</option>
+              <option value="liquid-glass">Liquid Glass</option>
+              <option value="__custom__" data-i18n="theme.custom">Custom</option>
             </select>
-            <button
-              data-theme-import
-              class="theme-toolbar-button user-space-menu-action hover:opacity-80 cursor-pointer p-1 flex items-center justify-center"
-              data-i18n-title="terminal.importTheme"
-              title="导入主题"
-            >
-              <span
-                class="material-symbols-outlined"
-                style="font-variation-settings: &quot;FILL&quot; 0"
-                >upload_file</span
-              >
-              <span
-                class="user-space-action-label"
-                data-i18n="terminal.importTheme"
-                >导入主题</span
-              >
-            </button>
             <div data-language-switcher></div>
             <div id="user-info" class="flex items-center gap-3">
               <!-- 动态渲染：头像 + 用户名 -->
             </div>
+            <button type="button" data-mcp-open class="user-space-menu-action assistant-icon-button hidden" data-i18n-title="mcp.title" data-i18n-aria-label="mcp.title" aria-label="External AI assistant MCP settings" title="External AI assistant MCP settings">
+              <span data-assistant-icon="mcp" aria-hidden="true"></span>
+              <span class="user-space-action-label" data-i18n="mcp.title">External AI assistant MCP settings</span>
+            </button>
             <button
               id="ai-config-btn"
               class="user-space-menu-action hover:opacity-80 transition-opacity cursor-pointer p-1 flex items-center justify-center"
               data-i18n-title="agent.settings"
+              data-i18n-aria-label="agent.settings"
+              aria-label="AI Agent settings"
               title="AI Agent 设置"
+            >
+              <span class="assistant-entry-icon" data-assistant-icon="agent" aria-hidden="true"></span>
+              <span class="user-space-action-label" data-i18n="agent.settings"
+                >AI Agent 设置</span
+              >
+            </button>
+            <button
+              id="mobile-shortcuts-config-btn"
+              type="button"
+              class="user-space-menu-action mobile-only hover:opacity-80 transition-opacity cursor-pointer p-1 flex items-center justify-center"
+              data-i18n-title="mobileShortcuts.title"
+              title="自定义快捷键"
             >
               <span
                 class="material-symbols-outlined"
-                style="font-variation-settings: &quot;FILL&quot; 0"
-                >psychology</span
+                style="font-variation-settings: 'FILL' 0"
+                aria-hidden="true"
+                >keyboard</span
               >
-              <span class="user-space-action-label" data-i18n="agent.settings"
-                >AI Agent 设置</span
+              <span class="user-space-action-label" data-i18n="mobileShortcuts.title"
+                >自定义快捷键</span
               >
             </button>
             <button
@@ -173,7 +266,7 @@
             >
               <span
                 class="material-symbols-outlined"
-                style="font-variation-settings: &quot;FILL&quot; 0"
+                style="font-variation-settings: 'FILL' 0"
                 >logout</span
               >
               <span class="user-space-action-label" data-i18n="auth.logout"
@@ -293,7 +386,7 @@
                     >
                   </button>
                 </div>
-                <div id="server-tag-filter-wrapper" class="hidden sm:w-52">
+                <div id="server-tag-filter-wrapper" class="hidden sm:w-44">
                   <label
                     for="server-tag-filter"
                     class="sr-only"
@@ -306,6 +399,25 @@
                     data-i18n-aria-label="server.tagFilter"
                     aria-label="按标签筛选"
                   ></select>
+                </div>
+                <div id="server-sort-wrapper" class="sm:w-40">
+                  <label
+                    for="server-sort"
+                    class="sr-only"
+                    data-i18n="server.sortLabel"
+                    >排序方式</label
+                  >
+                  <select
+                    id="server-sort"
+                    class="terminal-input text-[13px] w-full cursor-pointer"
+                    data-i18n-aria-label="server.sortLabel"
+                    aria-label="排序方式"
+                  >
+                    <option value="recent" data-i18n="server.sortRecent">最近连接</option>
+                    <option value="updated" data-i18n="server.sortUpdated">最近修改</option>
+                    <option value="created" data-i18n="server.sortCreated">添加时间</option>
+                    <option value="name" data-i18n="server.sortName">名称 (A-Z)</option>
+                  </select>
                 </div>
               </div>
             </div>
@@ -349,12 +461,14 @@
               id="server-search-empty"
               class="hidden flex-col items-center justify-center py-16"
             >
-              <span
-                class="material-symbols-outlined text-dim mb-3"
-                style="font-size: 48px"
-                aria-hidden="true"
-                >search_off</span
-              >
+              <div class="empty-state-badge" aria-hidden="true">
+                <span
+                  class="material-symbols-outlined"
+                  style="font-size: 34px"
+                  aria-hidden="true"
+                  >search_off</span
+                >
+              </div>
               <p
                 class="text-muted text-sm tracking-[0.08em] mb-2"
                 data-i18n="server.noMatches"
@@ -370,14 +484,16 @@
               id="empty-state"
               class="hidden flex-col items-center justify-center py-20"
             >
-              <span
-                class="material-symbols-outlined text-dim mb-4"
-                style="
-                  font-size: 64px;
-                  font-variation-settings: &quot;FILL&quot; 0;
-                "
-                >dns</span
-              >
+              <div class="empty-state-badge" aria-hidden="true">
+                <span
+                  class="material-symbols-outlined"
+                  style="
+                    font-size: 36px;
+                    font-variation-settings: 'FILL' 0;
+                  "
+                  >dns</span
+                >
+              </div>
               <p
                 class="text-muted text-sm tracking-[0.1em] mb-2"
                 data-i18n="server.none"
@@ -402,7 +518,7 @@
 
         <!-- Footer -->
         <footer
-          class="user-space-footer px-6 py-2 flex justify-between items-center z-50 bg-elevated border-t border-outline-variant text-xs h-12"
+          class="user-space-footer px-6 py-0 flex justify-between items-center z-50 bg-elevated border-t border-outline-variant text-xs h-8"
         >
            <!-- <div
             class="user-space-footer-source text-secondary-container opacity-60"
@@ -413,7 +529,8 @@
               - https://github.com/newbietan/CloudSSH</span
             >
           </div>
-          <div class="flex gap-4">
+          <div class="footer-meta">
+            <div data-version-notice></div>
             <a
               class="text-on-surface-variant opacity-60 hover:opacity-100 transition-opacity"
               href="https://github.com/newbietan/CloudSSH"
@@ -434,13 +551,13 @@
       >
         <div class="modal-overlay absolute inset-0" id="modal-backdrop"></div>
         <div
-          class="responsive-modal-panel cyber-box p-6 shadow-2xl relative z-10 w-full max-w-md mx-4"
+          class="responsive-modal-panel server-modal-panel cyber-box p-6 shadow-2xl relative z-10 w-full"
         >
           <div
             class="theme-accent-line absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-[var(--accent-secondary)] to-transparent opacity-50"
           ></div>
           <div
-            class="flex items-center justify-between mb-6 pb-4 border-b border-dim"
+            class="server-modal-header flex items-center justify-between pb-4 border-b border-dim"
           >
             <span
               id="modal-title"
@@ -450,19 +567,20 @@
             >
             <button
               id="modal-close-btn"
-              class="text-muted hover:text-primary transition-colors cursor-pointer"
+              class="panel-close-btn"
               data-i18n-aria-label="common.close"
               aria-label="关闭"
             >
               <span
                 class="material-symbols-outlined"
-                style="font-size: 20px"
                 aria-hidden="true"
                 >close</span
               >
             </button>
           </div>
-          <form id="server-form" class="space-y-4">
+          <form id="server-form" class="server-modal-form">
+            <div class="server-modal-fields">
+            <div class="server-identity-fields">
             <div>
               <label
                 for="server-name"
@@ -508,10 +626,40 @@
                 使用逗号分隔，最多 10 个标签
               </div>
             </div>
-            <div class="grid grid-cols-1 sm:grid-cols-4 gap-4">
-              <div class="sm:col-span-3">
+            </div>
+            <div class="server-settings-columns">
+            <section class="server-settings-section" aria-labelledby="server-transport-label">
+            <div>
+              <label
+                id="server-transport-label"
+                class="block text-xs font-bold tracking-[0.1em] text-muted mb-2"
+                data-i18n="server.transportMode"
+                >网络连接</label
+              >
+              <div class="server-choice-tabs mb-1">
+                <button
+                  type="button"
+                  id="modal-transport-tab-direct"
+                  class="auth-tab auth-tab-active px-3 py-1 text-[11px] font-bold tracking-[0.1em] cursor-pointer transition-all"
+                  data-i18n="server.transportDirect"
+                >
+                  直连 / 跳板机
+                </button>
+                <button
+                  type="button"
+                  id="modal-transport-tab-tunnel"
+                  class="auth-tab px-3 py-1 text-[11px] font-bold tracking-[0.1em] cursor-pointer transition-all"
+                  data-i18n="server.transportTunnel"
+                >
+                  Cloudflare 隧道
+                </button>
+              </div>
+            </div>
+            <div class="ssh-endpoint-fields">
+              <div class="ssh-host-field" id="server-host-field">
                 <label
                   for="server-host"
+                  id="server-host-label"
                   class="block text-xs font-bold tracking-[0.1em] text-muted mb-2"
                   data-i18n="auth.host"
                   >主机地址</label
@@ -527,7 +675,7 @@
                   />
                 </div>
               </div>
-              <div class="sm:col-span-1">
+              <div class="ssh-port-field" id="server-port-field">
                 <label
                   for="server-port"
                   class="block text-xs font-bold tracking-[0.1em] text-muted mb-2"
@@ -573,7 +721,7 @@
                 />
               </div>
             </div>
-            <div>
+            <div id="server-jump-host-section">
               <label
                 for="server-jump-host"
                 class="block text-xs font-bold tracking-[0.1em] text-muted mb-2"
@@ -600,13 +748,88 @@
                 可选择已保存服务器；最多递归跳转 3 级
               </div>
             </div>
+            <div
+              id="server-cf-access-section"
+              class="hidden pt-2 pb-2 border-t border-b border-dim"
+            >
+              <button
+                type="button"
+                id="server-cf-access-toggle"
+                class="w-full text-left text-[11px] font-bold tracking-[0.05em] text-[var(--accent-secondary)] flex items-center gap-1.5 cursor-pointer"
+                aria-expanded="false"
+                aria-controls="server-cf-access-fields"
+              >
+                <span class="material-symbols-outlined" style="font-size: 16px"
+                  >security</span
+                >
+                <span class="flex-1" data-i18n="server.cfAccessTitle"
+                  >Cloudflare Zero Trust 访问凭据 (可选)</span
+                >
+                <span
+                  id="server-cf-access-chevron"
+                  class="material-symbols-outlined"
+                  style="font-size: 18px"
+                  aria-hidden="true"
+                  >expand_more</span
+                >
+              </button>
+              <div id="server-cf-access-fields" class="server-service-token-fields hidden pt-3">
+              <div>
+                <label
+                  for="server-cf-client-id"
+                  class="block text-xs font-bold tracking-[0.1em] text-muted mb-2"
+                  data-i18n="server.cfClientId"
+                  >Service Token Client ID</label
+                >
+                <input
+                  id="server-cf-client-id"
+                  class="terminal-input text-[13px] w-full"
+                  type="text"
+                  placeholder="xxxxxxxxxxxx.access"
+                  autocomplete="off"
+                />
+              </div>
+              <div>
+                <div class="flex flex-wrap items-center justify-between gap-1 mb-2">
+                  <label
+                    for="server-cf-client-secret"
+                    class="block text-xs font-bold tracking-[0.1em] text-muted"
+                    data-i18n="server.cfClientSecret"
+                    >Service Token Client Secret</label
+                  >
+                  <button
+                    type="button"
+                    id="server-cf-clear-secret-btn"
+                    class="hidden text-[10px] text-[var(--accent)] hover:underline cursor-pointer flex items-center gap-0.5"
+                  >
+                    <span class="material-symbols-outlined" style="font-size: 12px">delete</span>
+                    <span data-i18n="server.clearSecret">清除已存密钥</span>
+                  </button>
+                </div>
+                <input
+                  id="server-cf-client-secret"
+                  class="terminal-input text-[13px] w-full"
+                  type="password"
+                  placeholder="••••••••"
+                  autocomplete="off"
+                />
+                <div
+                  id="server-cf-secret-status"
+                  class="hidden text-[10px] text-[var(--accent-secondary)] mt-1"
+                ></div>
+              </div>
+              </div>
+            </div>
+            </section>
+            <section class="server-settings-section" aria-labelledby="server-auth-label">
             <div>
               <label
+                id="server-auth-label"
                 class="block text-xs font-bold tracking-[0.1em] text-muted mb-2"
                 data-i18n="auth.method"
                 >认证方式</label
               >
-              <div class="flex gap-2 mb-3">
+              <div class="server-choice-tabs mb-3">
                 <button
                   type="button"
                   id="modal-auth-tab-password"
@@ -623,6 +846,40 @@
                 >
                   私钥
                 </button>
+                <button
+                  type="button"
+                  id="modal-auth-tab-cf-ca"
+                  class="auth-tab hidden px-3 py-1 text-[11px] font-bold tracking-[0.1em] cursor-pointer transition-all"
+                  data-i18n="auth.cfSshCa"
+                >
+                  Cloudflare CA
+                </button>
+                <button
+                  type="button"
+                  id="modal-auth-tab-none"
+                  class="auth-tab px-3 py-1 text-[11px] font-bold tracking-[0.1em] cursor-pointer transition-all"
+                  data-i18n="auth.none"
+                ></button>
+              </div>
+              <p id="modal-none-section" class="text-xs text-muted" style="display: none" data-i18n="auth.noneHint"></p>
+              <div id="modal-cf-ca-section" style="display: none" class="space-y-2">
+                <label
+                  for="server-cf-ca-team"
+                  class="block text-xs font-bold tracking-[0.1em] text-muted mb-1"
+                  data-i18n="auth.cfTeamName"
+                  >Zero Trust 团队标识</label
+                >
+                <div class="flex items-center">
+                  <span class="material-symbols-outlined text-muted mr-2" style="font-size: 16px">verified_user</span>
+                  <input
+                    id="server-cf-ca-team"
+                    class="terminal-input text-[13px]"
+                    data-i18n-placeholder="auth.cfTeamNamePlaceholder"
+                    placeholder="mycompany"
+                    type="text"
+                    autocomplete="off"
+                  />
+                </div>
               </div>
               <div id="modal-password-section">
                 <div class="flex items-center">
@@ -638,7 +895,15 @@
                     type="password"
                     data-i18n-aria-label="common.password"
                     aria-label="密码"
+                    aria-describedby="server-password-hint"
                   />
+                </div>
+                <p id="server-password-hint" class="text-xs text-muted mt-2" data-i18n="auth.passwordHint"></p>
+                <div id="server-empty-password-option" class="hidden mt-2">
+                  <label class="flex items-center gap-2 text-xs text-muted cursor-pointer">
+                    <input id="server-empty-password" type="checkbox" class="accent-[var(--accent)] w-4 h-4" />
+                    <span data-i18n="server.useEmptyPassword"></span>
+                  </label>
                 </div>
               </div>
               <div id="modal-key-section" style="display: none">
@@ -658,7 +923,7 @@
                 ></textarea>
               </div>
             </div>
-            <div>
+            <div id="server-region-section">
               <label
                 for="server-region"
                 class="block text-xs font-bold tracking-[0.1em] text-muted mb-2"
@@ -676,7 +941,7 @@
                 "
               >
                 <option value="" data-i18n="region.auto">
-                  自动（保存时由系统推断）
+                  自动（部分场景需手动选择）
                 </option>
               </select>
               <div
@@ -684,7 +949,10 @@
                 class="text-[10px] text-muted mt-1"
               ></div>
             </div>
-            <div class="pt-2">
+            </section>
+            </div>
+            </div>
+            <div class="server-modal-actions">
               <button
                 id="server-submit-btn"
                 class="cyber-button w-full py-3 px-4 text-xs font-bold tracking-[0.1em] uppercase flex items-center justify-center gap-2 bg-primary text-on-primary"
@@ -729,41 +997,67 @@
               <option value="standard-dark">Standard Dark</option>
               <option value="standard-light">Standard Light</option>
               <option value="cyberpunk">Cyberpunk</option>
-              <option value="apple">Apple · Soft</option>
-              <option value="gruvbox">Gruvbox · Dense</option>
-              <option value="crt">CRT Amber</option>
-              <option value="glass">Glass · Soft</option>
+              <option value="liquid-glass">Liquid Glass</option>
+              <option value="__custom__" data-i18n="theme.custom">Custom</option>
             </select>
-            <button
-              id="import-theme-btn"
-              data-theme-import
-              class="desktop-terminal-action theme-toolbar-button hover:opacity-80 cursor-pointer p-1 flex items-center justify-center"
-              data-i18n-title="terminal.importTheme"
-              title="导入主题"
-            >
-              <span
-                class="material-symbols-outlined"
-                style="font-variation-settings: &quot;FILL&quot; 0"
-                >upload_file</span
-              >
-            </button>
             <input
               type="file"
               id="import-theme-input"
               accept=".json"
               class="hidden"
             />
-            <button
-              id="sftp-toggle-btn"
-              class="hover:opacity-80 transition-opacity cursor-pointer p-1 flex items-center justify-center"
-              data-i18n-title="terminal.sftp"
-              title="SFTP 文件管理器"
-            >
-              <span
-                class="material-symbols-outlined"
-                style="font-variation-settings: &quot;FILL&quot; 0"
-                >folder_open</span
+            <div id="terminal-drawer-segmented-bar" class="desktop-terminal-action drawer-segmented-bar" role="tablist" aria-label="抽屉功能切换">
+              <div class="drawer-segmented-lens"></div>
+              <button
+                id="sftp-toggle-btn"
+                type="button"
+                role="tab"
+                class="drawer-segmented-btn"
+                aria-selected="false"
+                data-drawer="sftp"
+                data-i18n-title="terminal.sftp"
+                title="SFTP 文件管理器"
               >
+                <span
+                  class="material-symbols-outlined drawer-btn-icon"
+                  style="font-variation-settings: 'FILL' 0"
+                  >folder_open</span
+                >
+                <span class="drawer-btn-label" data-i18n="terminal.drawer.sftp">SFTP</span>
+              </button>
+              <button
+                id="snippet-toggle-btn"
+                type="button"
+                role="tab"
+                class="drawer-segmented-btn"
+                aria-selected="false"
+                data-drawer="snippet"
+                data-i18n-title="terminal.snippets"
+                title="Command snippets"
+              >
+                <span
+                  class="material-symbols-outlined drawer-btn-icon"
+                  style="font-variation-settings: 'FILL' 0"
+                  >terminal</span
+                >
+                <span class="drawer-btn-label" data-i18n="terminal.drawer.snippets">自定义命令</span>
+              </button>
+              <button
+                id="agent-toggle-btn"
+                type="button"
+                role="tab"
+                class="drawer-segmented-btn hidden"
+                aria-selected="false"
+                data-drawer="agent"
+                data-i18n-title="terminal.agent"
+                title="AI Agent 助手"
+              >
+                <span class="drawer-btn-icon" data-assistant-icon="agent" aria-hidden="true"></span>
+                <span class="drawer-btn-label" data-i18n="terminal.drawer.agent">Agent</span>
+              </button>
+            </div>
+            <button type="button" data-mcp-open class="desktop-terminal-action assistant-icon-button hidden" data-i18n-title="mcp.title" data-i18n-aria-label="mcp.title" aria-label="External AI assistant MCP settings" title="External AI assistant MCP settings">
+              <span data-assistant-icon="mcp" aria-hidden="true"></span>
             </button>
             <button
               id="search-btn"
@@ -773,7 +1067,7 @@
             >
               <span
                 class="material-symbols-outlined"
-                style="font-variation-settings: &quot;FILL&quot; 0"
+                style="font-variation-settings: 'FILL' 0"
                 >search</span
               >
             </button>
@@ -785,32 +1079,8 @@
             >
               <span
                 class="material-symbols-outlined"
-                style="font-variation-settings: &quot;FILL&quot; 0"
+                style="font-variation-settings: 'FILL' 0"
                 >download</span
-              >
-            </button>
-            <button
-              id="snippet-toggle-btn"
-              class="hover:opacity-80 transition-opacity cursor-pointer p-1 flex items-center justify-center"
-              data-i18n-title="terminal.snippets"
-              title="Command snippets"
-            >
-              <span
-                class="material-symbols-outlined"
-                style="font-variation-settings: &quot;FILL&quot; 0"
-                >terminal</span
-              >
-            </button>
-            <button
-              id="agent-toggle-btn"
-              class="hover:opacity-80 transition-opacity cursor-pointer p-1 flex items-center justify-center hidden"
-              data-i18n-title="terminal.agent"
-              title="AI Agent 助手"
-            >
-              <span
-                class="material-symbols-outlined"
-                style="font-variation-settings: &quot;FILL&quot; 0"
-                >psychology</span
               >
             </button>
             <button
@@ -821,7 +1091,7 @@
             >
               <span
                 class="material-symbols-outlined"
-                style="font-variation-settings: &quot;FILL&quot; 0"
+                style="font-variation-settings: 'FILL' 0"
                 >power_settings_new</span
               >
             </button>
@@ -855,12 +1125,13 @@
                 <option value="standard-dark">Standard Dark</option>
                 <option value="standard-light">Standard Light</option>
                 <option value="cyberpunk">Cyberpunk</option>
-                <option value="apple">Apple · Soft</option>
-                <option value="gruvbox">Gruvbox · Dense</option>
-                <option value="crt">CRT Amber</option>
-                <option value="glass">Glass · Soft</option>
+                <option value="liquid-glass">Liquid Glass</option>
+                <option value="__custom__" data-i18n="theme.custom">Custom</option>
               </select>
             </label>
+            <button type="button" data-mcp-open class="hidden" data-i18n-title="mcp.title" data-i18n-aria-label="mcp.title" aria-label="External AI assistant MCP settings" title="External AI assistant MCP settings">
+              <span data-assistant-icon="mcp" aria-hidden="true"></span><span data-i18n="mcp.title">External AI assistant MCP settings</span>
+            </button>
             <button id="mobile-search-btn" type="button">
               <span class="material-symbols-outlined" aria-hidden="true"
                 >search</span
@@ -871,15 +1142,23 @@
                 >terminal</span
               ><span data-i18n="snippets.title">Command snippets</span>
             </button>
+            <button id="mobile-shortcuts-terminal-btn" type="button" class="hidden">
+              <span class="material-symbols-outlined" aria-hidden="true"
+                >keyboard</span
+              ><span data-i18n="mobileShortcuts.title">自定义快捷键</span>
+            </button>
+            <button id="mobile-sftp-btn" type="button">
+              <span class="material-symbols-outlined" aria-hidden="true"
+                >folder_open</span
+              ><span data-i18n="terminal.sftp">SFTP 文件管理器</span>
+            </button>
+            <button id="mobile-agent-btn" type="button" class="hidden">
+              <span data-assistant-icon="agent" aria-hidden="true"></span><span data-i18n="terminal.agent">AI Agent 助手</span>
+            </button>
             <button id="mobile-export-btn" type="button">
               <span class="material-symbols-outlined" aria-hidden="true"
                 >download</span
               ><span data-i18n="terminal.export">导出终端日志</span>
-            </button>
-            <button type="button" data-theme-import>
-              <span class="material-symbols-outlined" aria-hidden="true"
-                >upload_file</span
-              ><span data-i18n="terminal.importTheme">导入主题</span>
             </button>
             <button id="mobile-landscape-btn" type="button">
               <span class="material-symbols-outlined" aria-hidden="true"
@@ -890,13 +1169,16 @@
                 >全屏横屏</span
               >
             </button>
+            <div class="mobile-version-notice" data-version-notice></div>
           </div>
         </header>
 
-        <!-- Tab Bar（标签栏） -->
+        <!-- Tab Bar（标签栏）：仅允许横向滚动。overflow-x-auto 会把 overflow-y 隐式变为 auto，
+             而标签项上下各 3px margin 的 margin-box 比 36px 高度减去 1px 下边框后多出 1px，
+             会在右侧绘制一条无效纵向滚动条，必须显式 overflow-y-hidden 禁止。 -->
         <div
           id="tab-bar"
-          class="flex items-center bg-background border-b border-outline-variant px-2 h-9 overflow-x-auto custom-scrollbar gap-0.5"
+          class="flex items-center bg-background border-b border-outline-variant px-2 h-9 overflow-x-auto overflow-y-hidden custom-scrollbar gap-0.5"
           style="scrollbar-width: thin"
         >
           <!-- 由 TabManager 动态渲染标签 -->
@@ -1069,7 +1351,7 @@
         >
           <span
             class="material-symbols-outlined"
-            style="font-size: 16px; font-variation-settings: &quot;FILL&quot; 0"
+            style="font-size: 16px; font-variation-settings: 'FILL' 0"
             aria-hidden="true"
             >quick_phrases</span
           >
@@ -1078,13 +1360,14 @@
 
         <!-- Footer -->
         <footer
-          class="terminal-footer px-6 py-2 flex justify-between items-center z-50 bg-elevated border-t border-outline-variant text-xs h-12 shrink-0"
+          class="terminal-footer px-6 py-0 flex justify-between items-center z-50 bg-elevated border-t border-outline-variant text-xs h-8 shrink-0"
         >
           <!--<div class="text-secondary-container opacity-60">
             © <span id="copyright-year"></span> CLOUD_SSH_TERMINAL -
             https://github.com/newbietan/CloudSSH
           </div>
-          <div class="flex gap-4">
+          <div class="footer-meta">
+            <div data-version-notice></div>
             <a
               class="text-on-surface-variant opacity-60 hover:opacity-100 transition-opacity"
               href="https://github.com/newbietan/CloudSSH"

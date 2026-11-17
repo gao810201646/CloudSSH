@@ -21,7 +21,12 @@ import {
   UI_STYLE_PRESETS,
   UI_THEMES,
 } from '../frontend/src/theme';
-import { SAFE_UI_THEME_PROPERTIES, THEME_MAX_BYTES } from '../src/theme-schema';
+import {
+  MAX_CUSTOM_THEMES,
+  normalizeUserThemePayload,
+  SAFE_UI_THEME_PROPERTIES,
+  THEME_MAX_BYTES,
+} from '../src/theme-schema';
 
 function relativeLuminance(hex: string): number {
   const channels = hex
@@ -73,7 +78,7 @@ describe('Standard 内置主题', () => {
       'brightWhite',
     ] as const;
 
-    for (const themeName of ['standard-dark', 'standard-light', 'apple', 'crt', 'glass'] as const) {
+    for (const themeName of ['standard-dark', 'standard-light', 'liquid-glass'] as const) {
       for (const key of ansiKeys) {
         expect(THEMES[themeName][key]).toMatch(/^#[0-9a-f]{6}$/i);
       }
@@ -81,7 +86,7 @@ describe('Standard 内置主题', () => {
   });
 
   it('主要文本、次要文本和强调色达到普通文字 4.5:1 对比度', () => {
-    for (const themeName of ['standard-dark', 'standard-light', 'apple', 'crt', 'glass'] as const) {
+    for (const themeName of ['standard-dark', 'standard-light', 'liquid-glass'] as const) {
       const ui = UI_THEMES[themeName];
       for (const foreground of ['--text', '--text-muted', '--text-dim', '--accent', '--error']) {
         expect(contrastRatio(ui[foreground], ui['--bg'])).toBeGreaterThanOrEqual(4.5);
@@ -133,33 +138,31 @@ describe('Theme V2 界面风格', () => {
   afterEach(() => applyBuiltInTheme('cyberpunk'));
 
   it('提供版本化外观结构，并让内置主题覆盖四种风格', () => {
-    expect(THEME_SCHEMA_VERSION).toBe(3);
+    expect(THEME_SCHEMA_VERSION).toBe(4);
     expect(BUILT_IN_APPEARANCE).toEqual({
       'standard-dark': { style: 'standard' },
       'standard-light': { style: 'standard' },
       cyberpunk: { style: 'cyberpunk' },
-      apple: { style: 'soft' },
-      gruvbox: { style: 'dense' },
-      crt: { style: 'cyberpunk' },
-      glass: { style: 'soft', blur: 'strong' },
+      'liquid-glass': { style: 'liquid', shape: 'soft', blur: 'strong' },
     });
     expect(Object.keys(UI_STYLE_PRESETS).sort()).toEqual([
       'cyberpunk',
       'dense',
+      'liquid',
       'soft',
       'standard',
     ]);
   });
 
   it('切换内置主题会同步形状、密度、字体、阴影、动效和组件风格', () => {
-    applyBuiltInTheme('apple');
+    applyBuiltInTheme('liquid-glass');
     expect(getActiveThemeAppearance()).toEqual({
-      style: 'soft',
+      style: 'liquid',
       shape: 'soft',
       density: 'comfortable',
       font: 'system',
       shadow: 'elevated',
-      motion: 'reduced',
+      motion: 'full',
       blur: 'strong',
       components: {
         button: 'soft',
@@ -169,10 +172,10 @@ describe('Theme V2 界面风格', () => {
       },
     });
 
-    applyBuiltInTheme('gruvbox');
-    expect(getActiveThemeAppearance().style).toBe('dense');
+    applyBuiltInTheme('cyberpunk');
+    expect(getActiveThemeAppearance().style).toBe('cyberpunk');
     expect(getActiveThemeAppearance().density).toBe('compact');
-    expect(getActiveThemeAppearance().components.card).toBe('flat');
+    expect(getActiveThemeAppearance().components.button).toBe('outline');
   });
 
   it('自定义主题可以在预设之上安全覆盖外观枚举', () => {
@@ -243,7 +246,7 @@ describe('Theme V2 界面风格', () => {
       normalizeImportedTheme({
         schemaVersion: 999,
         name: ' My Theme ',
-        baseTheme: 'gruvbox',
+        baseTheme: 'cyberpunk',
         colorScheme: 'dark',
         ui: {
           '--accent': '#abcdef',
@@ -256,15 +259,33 @@ describe('Theme V2 界面风格', () => {
         },
       })
     ).toEqual({
-      schemaVersion: 3,
+      schemaVersion: 4,
       name: 'My Theme',
-      baseTheme: 'gruvbox',
+      baseTheme: 'cyberpunk',
       colorScheme: 'dark',
       ui: { '--accent': '#abcdef' },
       appearance: {
         shape: 'soft',
         components: { button: 'solid' },
       },
+    });
+  });
+
+  it('旧版内置基础主题（gruvbox/apple 等）平滑映射到继任内置主题', () => {
+    expect(
+      normalizeImportedTheme({
+        schemaVersion: 2,
+        name: 'Legacy Gruvbox Custom',
+        baseTheme: 'gruvbox',
+        colorScheme: 'dark',
+        ui: { '--accent': '#b8bb26' },
+      })
+    ).toEqual({
+      schemaVersion: 4,
+      name: 'Legacy Gruvbox Custom',
+      baseTheme: 'standard-dark',
+      colorScheme: 'dark',
+      ui: { '--accent': '#b8bb26' },
     });
   });
 
@@ -279,7 +300,7 @@ describe('Theme V2 界面风格', () => {
         appearance: { style: 'soft' },
       })
     ).toEqual({
-      schemaVersion: 3,
+      schemaVersion: 4,
       name: 'Legacy Glacier Custom',
       colorScheme: 'dark',
       ui: { '--accent': '#67e8f9' },
@@ -315,7 +336,6 @@ describe('Standard 主题入口和编辑器', () => {
   const appCss = readFileSync(new URL('../frontend/src/style.css', import.meta.url), 'utf8');
   const mainSource = readFileSync(new URL('../frontend/src/main.ts', import.meta.url), 'utf8');
   const workerSource = readFileSync(new URL('../src/worker/index.ts', import.meta.url), 'utf8');
-  const userDbSource = readFileSync(new URL('../src/worker/user-db.ts', import.meta.url), 'utf8');
   const presetJson = editorHtml.match(
     /\/\* THEME_PRESETS_START \*\/ ([\s\S]+?) \/\* THEME_PRESETS_END \*\//
   )?.[1];
@@ -338,33 +358,50 @@ describe('Standard 主题入口和编辑器', () => {
     expect(editorHtml).toContain('colorScheme,');
   });
 
-  it('用户空间和终端页都可以直接切换主题风格', () => {
+  it('用户空间和终端页都可以直接切换主题风格，移除独立上传按钮并支持多主题常驻', () => {
     expect(appHtml.match(/data-theme-selector/g)).toHaveLength(3);
-    expect(appHtml.match(/data-theme-import/g)).toHaveLength(3);
+    expect(appHtml).not.toContain('data-theme-import');
     expect(appHtml).not.toContain('data-theme-export');
-    expect(appHtml).not.toContain('data-theme-delete');
-    expect(appHtml).toContain('Apple · Soft');
-    expect(appHtml).toContain('Gruvbox · Dense');
-    expect(appHtml).toContain('CRT Amber');
-    expect(appHtml).toContain('Glass · Soft');
+    expect(appHtml).toContain('Liquid Glass');
   });
 
-  it('Pages 保持独立，应用为登录用户同步单个自定义主题', () => {
-    expect(mainSource).toContain("localStorage.setItem('cloudssh_imported_theme'");
-    expect(mainSource).not.toContain('[data-theme-export]');
-    expect(mainSource).not.toContain('[data-theme-delete]');
-    expect(mainSource).toContain("fetch('/api/user/theme'");
-    expect(mainSource).toContain("method: 'PUT'");
-    expect(mainSource).toContain(
-      'void restoreCloudTheme(initialThemeSelection, themeSelectionRevision)'
+  it('背景裁剪层独立于应用内容，漂移只通过 transform 合成且不降低材质配置', () => {
+    expect(appHtml.match(/class="app-background" aria-hidden="true"/g)).toHaveLength(1);
+    expect(appHtml).toMatch(
+      /class="app-background" aria-hidden="true"><\/div>\s*(?:<!--[\s\S]*?-->\s*)?<div id="app-loading"/
     );
-    // glacier 已被 Apple 取代：旧选择在恢复时迁移到 Standard Dark，避免静默回退到默认主题
-    expect(mainSource).toContain("selection === 'glacier'");
+    expect(appHtml).toMatch(
+      /<\/main>\s*<\/div>\s*<div id="app" hidden inert aria-hidden="true">/
+    );
+
+    const keyframes = appCss.match(/@keyframes theme-bg-drift \{([\s\S]*?)\n\}/)?.[1];
+    expect(keyframes).toBeDefined();
+    const declarations = keyframes!.replace(/\/\*[\s\S]*?\*\//g, '');
+    expect(declarations.match(/transform:/g)).toHaveLength(2);
+    expect(declarations).not.toMatch(/background-position|filter:|opacity:/);
+    expect(appCss).toContain('animation: theme-bg-drift 35s ease-in-out infinite alternate');
+    expect(appCss).toContain("html[data-ui-motion='none'] .app-background::before");
+    expect(appCss).toContain('@media (prefers-reduced-motion: reduce)');
+    expect(appCss).not.toMatch(/will-change:\s*(?:background|filter)/);
+
+    expect(BUILT_IN_BACKGROUND['liquid-glass']).toEqual({
+      type: 'mesh',
+      stops: ['#a2d2ff', '#d8b4fe', '#ffc8dd', '#bde0fe', '#ffdfba'],
+      angle: 135,
+      scrim: 0.35,
+      animation: 'drift',
+    });
+    expect(UI_STYLE_PRESETS.liquid).toMatchObject({ blur: 'strong', motion: 'full' });
+    expect(BUILT_IN_EFFECTS['liquid-glass']).toEqual({ glow: 0.35 });
+  });
+
+  it('Pages 保持独立，应用为登录用户同步自定义主题并保留旧版平滑迁移', () => {
+    expect(editorHtml).not.toContain('/api/user/theme');
+    // 旧版内置主题在恢复时平滑迁移到当前内置主题，避免静默回退到默认主题
+    expect(mainSource).toContain('LEGACY_THEME_MIGRATION');
+    expect(mainSource).toContain("glacier: 'standard-dark'");
     expect(mainSource).toContain("'standard-dark'");
     expect(workerSource).toContain("url.pathname === '/api/user/theme'");
-    expect(userDbSource).toContain('CREATE TABLE IF NOT EXISTS user_themes');
-    expect(userDbSource).not.toContain('handleDeleteTheme');
-    expect(editorHtml).not.toContain('/api/user/theme');
   });
 
   it('样式表使用语义令牌实现外观与布局解耦', () => {
@@ -392,10 +429,7 @@ describe('Standard 主题入口和编辑器', () => {
       'standard-dark',
       'standard-light',
       'cyberpunk',
-      'apple',
-      'gruvbox',
-      'crt',
-      'glass',
+      'liquid-glass',
     ]) {
       expect(editorHtml).toContain(`<option value="${themeName}"`);
     }
@@ -421,7 +455,7 @@ describe('Standard 主题入口和编辑器', () => {
     for (const field of ['button', 'input', 'card', 'tabs']) {
       expect(editorHtml).toContain(`key: '${field}'`);
     }
-    expect(editorHtml).toContain('schemaVersion: 3');
+    expect(editorHtml).toContain('schemaVersion: 4');
     expect(editorHtml).toContain('baseTheme: activePreset');
     expect(editorHtml).toContain('sanitizeAppearance(data.appearance)');
     expect(editorHtml).toContain('file.size > THEME_MAX_BYTES');
@@ -431,14 +465,13 @@ describe('Standard 主题入口和编辑器', () => {
     expect(editorHtml).toContain('ui: safeUiTheme');
     expect(editorHtml).not.toContain('transition: all');
     expect(THEME_MAX_BYTES).toBe(64 * 1024);
-    expect(editorPresets.apple.appearance).toMatchObject({
-      style: 'soft',
+    expect(editorPresets['liquid-glass'].appearance).toMatchObject({
+      style: 'liquid',
       shape: 'soft',
       density: 'comfortable',
     });
-    expect(editorPresets.crt.background).toMatchObject({ type: 'radial' });
-    expect(editorPresets.glass.background).toMatchObject({ type: 'mesh', animation: 'drift' });
-    expect(editorPresets.glass.appearance).toMatchObject({ blur: 'strong' });
+    expect(editorPresets['liquid-glass'].background).toMatchObject({ type: 'mesh', animation: 'drift' });
+    expect(editorPresets['liquid-glass'].appearance).toMatchObject({ blur: 'strong' });
   });
 
   it('终端订阅全局主题并在销毁时解除订阅', () => {
@@ -528,12 +561,71 @@ describe('Theme V3 背景层、效果与版式', () => {
   });
 
   it('内置主题携带差异化的背景、效果与版式配置', () => {
-    expect(BUILT_IN_BACKGROUND.crt?.type).toBe('radial');
-    expect(BUILT_IN_BACKGROUND.glass?.type).toBe('mesh');
-    expect(BUILT_IN_BACKGROUND.glass?.animation).toBe('drift');
+    expect(BUILT_IN_BACKGROUND['liquid-glass']?.type).toBe('mesh');
+    expect(BUILT_IN_BACKGROUND['liquid-glass']?.animation).toBe('drift');
     expect(BUILT_IN_EFFECTS.cyberpunk).toEqual({ scanline: 1, flicker: 1 });
-    expect(BUILT_IN_EFFECTS.crt?.glow).toBeGreaterThan(0);
-    expect(BUILT_IN_TYPOGRAPHY.glass?.radiusScale).toBeGreaterThan(1);
+    expect(BUILT_IN_EFFECTS['liquid-glass']?.glow).toBeGreaterThan(0);
+    expect(BUILT_IN_TYPOGRAPHY['liquid-glass']?.radiusScale).toBeGreaterThan(1);
     expect(BUILT_IN_BACKGROUND['standard-dark']).toBeUndefined();
+  });
+
+  describe('多自定义主题契约 — normalizeUserThemePayload', () => {
+    it('平滑升级旧版单主题对象', () => {
+      const legacyTheme = {
+        name: 'My Old Theme',
+        ui: { '--accent': '#ff0055' },
+        colorScheme: 'dark',
+      };
+      const res = normalizeUserThemePayload(legacyTheme);
+      expect(res).not.toBeNull();
+      expect(res!.themes).toHaveLength(1);
+      expect(res!.themes[0].id).toBe('default');
+      expect(res!.themes[0].name).toBe('My Old Theme');
+      expect(res!.themes[0].data.ui!['--accent']).toBe('#ff0055');
+      expect(res!.activeId).toBe('default');
+    });
+
+    it('正确解析多主题数组并校验 activeId', () => {
+      const payload = {
+        active_id: 't2',
+        themes: [
+          {
+            id: 't1',
+            name: 'Theme 1',
+            data: { ui: { '--accent': '#111111' } },
+            createdAt: 1000,
+          },
+          {
+            id: 't2',
+            name: 'Theme 2',
+            data: { ui: { '--accent': '#222222' } },
+            createdAt: 2000,
+          },
+        ],
+      };
+      const res = normalizeUserThemePayload(payload);
+      expect(res).not.toBeNull();
+      expect(res!.themes).toHaveLength(2);
+      expect(res!.activeId).toBe('t2');
+      expect(res!.themes[1].data.ui!['--accent']).toBe('#222222');
+    });
+
+    it('限制多主题数量不超过 MAX_CUSTOM_THEMES (20)', () => {
+      const manyThemes = Array.from({ length: 30 }, (_, i) => ({
+        id: `theme_${i}`,
+        name: `Theme ${i}`,
+        data: { ui: { '--accent': '#00ff00' } },
+      }));
+      const res = normalizeUserThemePayload({ themes: manyThemes });
+      expect(res).not.toBeNull();
+      expect(res!.themes.length).toBe(MAX_CUSTOM_THEMES);
+      expect(res!.themes.length).toBe(20);
+    });
+
+    it('非法或空 payload 返回 null', () => {
+      expect(normalizeUserThemePayload(null)).toBeNull();
+      expect(normalizeUserThemePayload('not an object')).toBeNull();
+      expect(normalizeUserThemePayload({ themes: 'invalid' })).toBeNull();
+    });
   });
 });

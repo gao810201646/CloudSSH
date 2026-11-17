@@ -1,3 +1,4 @@
+import { getSFTPUploadPolicy } from '../../src/sftp-upload-policy';
 import {
   type ActiveEditorSession,
   type EditReadErrorCode,
@@ -17,6 +18,8 @@ import {
 } from './sftp-helpers';
 import { updateSelection } from './sftp-selection';
 import { Deferred, UploadWaiter } from './sftp-transfer';
+import { SFTPLinkResolver } from './sftp-link-resolver';
+import { attachDrawerSwipeToClose } from './drawer-swipe';
 import {
   confirmDeleteItems,
   promptMkdirName,
@@ -24,6 +27,7 @@ import {
   promptRename,
 } from './sftp-dialogs';
 import { confirmAction, notify } from './ui-feedback';
+import { StreamingSHA256 } from './sha256-stream';
 
 export interface SFTPFileEntry {
   name: string;
@@ -39,12 +43,18 @@ export interface SFTPFileEntry {
 
 export type GetSFTPWebSocketUrlFn = () => string | null;
 
-const UPLOAD_CHUNK_SIZE = 128 * 1024;
-const UPLOAD_CONCURRENCY = 8;
+export const UPLOAD_CHUNK_SIZE = 32 * 1024; // 32KB — 对齐 OpenSSH (DEFAULT_COPY_BUFLEN=32768) 与 FileZilla 工业标准
 const DOWNLOAD_URL_REVOKE_DELAY_MS = 1000;
 const SFTP_HEARTBEAT_INTERVAL_MS = 30000;
 
 export { shouldFallbackToDownload, type EditReadErrorCode };
+
+export function formatSFTPErrorMessage(message: string): string {
+  if (message.includes('Failure')) {
+    return t('sftp.error.failureHint');
+  }
+  return message;
+}
 
 export class SFTPPanel {
   private container: HTMLElement;
@@ -53,6 +63,8 @@ export class SFTPPanel {
   private renderedEntries: SFTPFileEntry[] = [];
   private sortOptions: SFTPSortOptions = { field: 'name', direction: 'asc' };
   private selectedEntries: Map<string, SFTPFileEntry> = new Map();
+  private entryRows = new Map<string, HTMLElement>();
+  private highlightedNames = new Set<string>();
   private selectionAnchorIndex: number | null = null;
   private pendingDeleteCount = 0;
   private getWebSocketUrl: GetSFTPWebSocketUrlFn;
@@ -75,6 +87,7 @@ export class SFTPPanel {
   private uploadQueuePending: number = 0;
   private uploadQueuedFiles: number = 0;
   private uploadActive: boolean = false;
+  private isTunnel: boolean = false;
   private uploadQueueGeneration: number = 0;
   private downloadWaiter: Deferred<void> | null = null;
   private downloadQueueTail: Promise<void> = Promise.resolve();
@@ -84,6 +97,11 @@ export class SFTPPanel {
   private downloadCancelRequested: boolean = false;
   private downloadQueueGeneration: number = 0;
   private readonly editorCoordinator: SFTPEditorCoordinator;
+  private readonly linkResolver = new SFTPLinkResolver(
+    (message) => this.sendJSON(message),
+    (reason) =>
+      this.showError(t(reason === 'timeout' ? 'sftp.linkResolveTimeout' : 'sftp.linkResolveFailed'))
+  );
 
   get activeEditor(): ActiveEditorSession | null {
     return this.editorCoordinator.getActiveEditor();
@@ -108,6 +126,10 @@ export class SFTPPanel {
     this.getWebSocketUrl = getWebSocketUrl;
     this.container = this.createPanel();
     document.body.appendChild(this.container);
+    attachDrawerSwipeToClose(this.container, {
+      headerSelector: '.sftp-panel-header',
+      onClose: () => this.hide(),
+    });
 
     this.editorCoordinator = new SFTPEditorCoordinator({
       isSftpReady: () => this.sftpReady,
@@ -127,6 +149,7 @@ export class SFTPPanel {
       translateDocument(this.container);
       this.hideContextMenu();
     });
+    this.bindEntryEvents();
     this.bindKeyboard();
   }
 
@@ -135,7 +158,6 @@ export class SFTPPanel {
     panel.id = 'sftp-panel';
     panel.className =
       'fixed top-0 right-0 h-full z-[90] flex transition-transform duration-300 ease-in-out';
-    panel.style.width = 'min(clamp(420px, 40vw, 600px), 100vw)';
     panel.style.transform = 'translateX(100%)';
 
     // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
@@ -147,8 +169,8 @@ export class SFTPPanel {
             <span class="material-symbols-outlined text-primary-container" style="font-size: 18px; font-variation-settings: 'FILL' 1;">folder_open</span>
             <span class="text-xs font-bold tracking-[0.1em] text-primary-container" data-i18n="sftp.title">SFTP 文件管理器</span>
           </div>
-          <button id="sftp-close-btn" class="hover:opacity-80 transition-opacity cursor-pointer p-1 text-on-surface-variant" data-i18n-title="sftp.close" title="关闭 SFTP 面板">
-            <span class="material-symbols-outlined" style="font-size: 18px;">close</span>
+          <button id="sftp-close-btn" class="panel-close-btn" data-i18n-title="sftp.close" title="关闭 SFTP 面板">
+            <span class="material-symbols-outlined">close</span>
           </button>
         </div>
 
@@ -241,13 +263,39 @@ export class SFTPPanel {
         <!-- File List -->
         <div id="sftp-file-list" class="flex-1 overflow-y-auto custom-scrollbar">
           <!-- Loading -->
-          <div id="sftp-loading" class="hidden flex items-center justify-center py-12">
-            <div class="animate-spin rounded-full h-6 w-6 border-2 border-primary-container border-t-transparent"></div>
+          <div id="sftp-loading" class="hidden flex-col gap-2 px-3 py-3" aria-hidden="true">
+            <div class="flex items-center gap-2 py-0.5">
+              <div class="skeleton-line shrink-0" style="width: 16px; height: 16px"></div>
+              <div class="skeleton-line" style="width: 55%"></div>
+            </div>
+            <div class="flex items-center gap-2 py-0.5">
+              <div class="skeleton-line shrink-0" style="width: 16px; height: 16px"></div>
+              <div class="skeleton-line" style="width: 72%"></div>
+            </div>
+            <div class="flex items-center gap-2 py-0.5">
+              <div class="skeleton-line shrink-0" style="width: 16px; height: 16px"></div>
+              <div class="skeleton-line" style="width: 44%"></div>
+            </div>
+            <div class="flex items-center gap-2 py-0.5">
+              <div class="skeleton-line shrink-0" style="width: 16px; height: 16px"></div>
+              <div class="skeleton-line" style="width: 63%"></div>
+            </div>
+            <div class="flex items-center gap-2 py-0.5">
+              <div class="skeleton-line shrink-0" style="width: 16px; height: 16px"></div>
+              <div class="skeleton-line" style="width: 38%"></div>
+            </div>
+            <div class="flex items-center gap-2 py-0.5">
+              <div class="skeleton-line shrink-0" style="width: 16px; height: 16px"></div>
+              <div class="skeleton-line" style="width: 58%"></div>
+            </div>
           </div>
           <!-- Empty state -->
-          <div id="sftp-empty" class="hidden flex flex-col items-center justify-center py-12 text-on-surface-variant">
-            <span class="material-symbols-outlined mb-2" style="font-size: 36px; font-variation-settings: 'FILL' 0;">folder_off</span>
+          <div id="sftp-empty" class="hidden flex-col items-center justify-center py-12 text-on-surface-variant">
+            <div class="empty-state-badge mb-3" style="width: 60px; height: 60px" aria-hidden="true">
+              <span class="material-symbols-outlined" style="font-size: 28px; font-variation-settings: 'FILL' 0;">folder_off</span>
+            </div>
             <span class="text-xs tracking-wider" data-i18n="sftp.empty">此目录为空</span>
+            <span class="text-[10px] text-dim mt-1.5 tracking-wider" data-i18n="sftp.emptyHint">拖拽文件到此面板即可上传</span>
           </div>
           <!-- Error state -->
           <div id="sftp-error" class="hidden flex flex-col items-center justify-center py-8 px-4 text-error">
@@ -274,6 +322,44 @@ export class SFTPPanel {
     translateDocument(panel);
 
     return panel;
+  }
+
+  /** One listener set per panel; refreshed/sorted rows use the current rendered index. */
+  private bindEntryEvents(): void {
+    const entriesContainer = this.container.querySelector<HTMLElement>('#sftp-entries')!;
+    const entryIndex = (event: Event): number | null => {
+      let target = event.target;
+      if (target instanceof Node && !(target instanceof Element)) target = target.parentElement;
+      if (!(target instanceof Element)) return null;
+      const row = target.closest<HTMLElement>('.sftp-entry');
+      if (!row || row.parentElement !== entriesContainer) return null;
+      const index = Number(row.dataset.idx);
+      return Number.isInteger(index) && index >= 0 && index < this.renderedEntries.length
+        ? index
+        : null;
+    };
+    entriesContainer.addEventListener('click', (event) => {
+      const index = entryIndex(event);
+      if (index === null) return;
+      this.selectEntry(index, {
+        additive: event.ctrlKey || event.metaKey,
+        range: event.shiftKey,
+      });
+    });
+    entriesContainer.addEventListener('dblclick', (event) => {
+      const index = entryIndex(event);
+      if (index !== null) void this.openEntry(this.renderedEntries[index]);
+    });
+    entriesContainer.addEventListener('contextmenu', (event) => {
+      const index = entryIndex(event);
+      if (index === null) return;
+      event.preventDefault();
+      const entry = this.renderedEntries[index];
+      if (!this.selectedEntries.has(entry.name)) {
+        this.selectEntry(index, { additive: false, range: false });
+      }
+      this.showContextMenu(event.clientX, event.clientY, entry);
+    });
   }
 
   private bindKeyboard(): void {
@@ -499,6 +585,7 @@ export class SFTPPanel {
       };
 
       ws.onerror = () => {
+        this.linkResolver.cancel();
         const message = t('sftp.websocketError');
         this.stopHeartbeat();
         this.connectingPromise = null;
@@ -519,6 +606,7 @@ export class SFTPPanel {
         this.connectingPromise = null;
 
         if (!this.closedByPanel.has(ws)) {
+          this.linkResolver.cancel();
           const message = t('sftp.connectionClosed');
           this.initializing = false;
           this.sftpReady = false;
@@ -564,6 +652,7 @@ export class SFTPPanel {
   }
 
   private closeWebSocket(code?: number, reason?: string): void {
+    this.linkResolver.cancel();
     this.stopHeartbeat();
     if (this.sftpWsRetryTimer) {
       clearTimeout(this.sftpWsRetryTimer);
@@ -587,10 +676,12 @@ export class SFTPPanel {
 
   // Handle messages from the backend
   handleMessage(msg: any): void {
+    if (this.linkResolver.handleMessage(msg)) return;
     switch (msg.type) {
       case 'sftp_ready':
         this.initializing = false;
         this.sftpReady = true;
+        this.isTunnel = msg.isTunnel === true;
         this.navigate('~');
         break;
       case 'sftp_list_result':
@@ -628,6 +719,9 @@ export class SFTPPanel {
         this.onDownloadCancelled();
         break;
       case 'sftp_upload_ready':
+        if (msg.isTunnel !== undefined) {
+          this.isTunnel = msg.isTunnel === true;
+        }
         this.onUploadReady();
         break;
       case 'sftp_upload_conflict':
@@ -640,7 +734,7 @@ export class SFTPPanel {
         this.onUploadProgress(msg.loaded, msg.total);
         break;
       case 'sftp_upload_complete':
-        this.onUploadComplete(msg.path);
+        this.onUploadComplete(msg.path, msg.hash, msg.hashMatch);
         break;
       case 'sftp_upload_cancelled':
         this.onUploadCancelled();
@@ -658,6 +752,7 @@ export class SFTPPanel {
         this.onDeleteResult(msg.path);
         break;
       case 'sftp_closed': {
+        this.linkResolver.cancel();
         const message = t('sftp.connectionClosed');
         this.initializing = false;
         this.sftpReady = false;
@@ -733,6 +828,7 @@ export class SFTPPanel {
 
   // Navigation
   private navigate(path: string): void {
+    this.linkResolver.cancel();
     this.showLoading();
     this.clearSelection();
     this.sendJSON({ type: 'sftp_list', path });
@@ -759,6 +855,7 @@ export class SFTPPanel {
 
   // Directory listing results
   private onListResult(path: string, entries: SFTPFileEntry[], isTruncated?: boolean): void {
+    this.linkResolver.cancel();
     this.currentPath = path;
     this.entries = entries;
 
@@ -786,6 +883,9 @@ export class SFTPPanel {
   private renderEntries(): void {
     const entriesContainer = this.container.querySelector('#sftp-entries')!;
     const emptyState = this.container.querySelector('#sftp-empty')!;
+    this.entryRows.clear();
+    this.highlightedNames.clear();
+    this.renderedEntries = [];
 
     if (this.entries.length === 0) {
       entriesContainer.innerHTML = '';
@@ -801,12 +901,16 @@ export class SFTPPanel {
     const sorted = sortSFTPEntries(this.entries, this.sortOptions);
     this.renderedEntries = sorted;
 
+    // 行级交错入场仅限中小目录；接近 2000 条上限的大目录批量动画会拖累渲染
+    const animateRows = sorted.length <= 150;
+
     // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
     entriesContainer.innerHTML = sorted
       .map(
         (entry, idx) => `
-      <div class="sftp-entry flex items-center gap-2 px-3 py-1.5 hover:bg-surface-variant cursor-pointer transition-colors border-b border-outline-variant/30 text-[12px]"
+      <div class="sftp-entry${animateRows ? ' sftp-entry--enter' : ''} flex items-center gap-2 px-3 py-1.5 hover:bg-surface-variant cursor-pointer transition-colors border-b border-outline-variant/30 text-[12px]"
            data-idx="${idx}" data-name="${this.escapeHtml(entry.name)}" data-type="${entry.type}"
+           ${animateRows ? `style="--stagger-index: ${Math.min(idx, 24)}"` : ''}
            role="option" aria-selected="${this.selectedEntries.has(entry.name)}" tabindex="-1">
         <span class="material-symbols-outlined shrink-0 ${entry.isDir ? 'text-primary-container' : entry.isLink ? 'text-secondary-container' : 'text-on-surface-variant'}"
               style="font-size: 16px; font-variation-settings: 'FILL' ${entry.isDir ? '1' : '0'};">
@@ -823,46 +927,11 @@ export class SFTPPanel {
       )
       .join('');
 
-    // Bind click events
-    entriesContainer.querySelectorAll('.sftp-entry').forEach((el) => {
-      el.addEventListener('click', (e) => {
-        const target = el as HTMLElement;
-        const idx = parseInt(target.dataset.idx!, 10);
-        this.selectEntry(idx, {
-          additive: (e as MouseEvent).ctrlKey || (e as MouseEvent).metaKey,
-          range: (e as MouseEvent).shiftKey,
-        });
-      });
-
-      el.addEventListener('dblclick', () => {
-        const target = el as HTMLElement;
-        const idx = parseInt(target.dataset.idx!, 10);
-        const entry = sorted[idx];
-        if (entry.isDir) {
-          this.navigate(
-            this.currentPath === '/' ? `/${entry.name}` : `${this.currentPath}/${entry.name}`
-          );
-          return;
-        }
-        // 双击智能“打开”：可编辑候选先尝试编辑器，明确不可编辑（超大/二进制/无法解码）时自动转下载
-        const path =
-          this.currentPath === '/' ? `/${entry.name}` : `${this.currentPath}/${entry.name}`;
-        void this.openEditorForFile(path, entry.name, entry.size, { fallbackToDownload: true });
-      });
-
-      // Right-click context menu
-      el.addEventListener('contextmenu', (e: Event) => {
-        const me = e as MouseEvent;
-        me.preventDefault();
-        const target = el as HTMLElement;
-        const idx = parseInt(target.dataset.idx!, 10);
-        const entry = sorted[idx];
-        if (!this.selectedEntries.has(entry.name)) {
-          this.selectEntry(idx, { additive: false, range: false });
-        }
-        this.showContextMenu(me.clientX, me.clientY, entry);
-      });
-    });
+    // Rebuild only the row lookup; delegated listeners stay on the stable parent.
+    for (const element of entriesContainer.children) {
+      const row = element as HTMLElement;
+      this.entryRows.set(row.dataset.name || '', row);
+    }
     this.syncSelectionUI();
   }
 
@@ -904,11 +973,20 @@ export class SFTPPanel {
   }
 
   private syncSelectionUI(): void {
-    this.container.querySelectorAll<HTMLElement>('.sftp-entry').forEach((element) => {
-      const selected = this.selectedEntries.has(element.dataset.name || '');
-      element.classList.toggle('bg-surface-variant', selected);
-      element.setAttribute('aria-selected', String(selected));
-    });
+    const selectedNames = new Set(this.selectedEntries.keys());
+    for (const name of this.highlightedNames) {
+      if (selectedNames.has(name)) continue;
+      const row = this.entryRows.get(name);
+      row?.classList.remove('bg-surface-variant');
+      row?.setAttribute('aria-selected', 'false');
+    }
+    for (const name of selectedNames) {
+      if (this.highlightedNames.has(name)) continue;
+      const row = this.entryRows.get(name);
+      row?.classList.add('bg-surface-variant');
+      row?.setAttribute('aria-selected', 'true');
+    }
+    this.highlightedNames = selectedNames;
   }
 
   private updateActionButtons(): void {
@@ -946,13 +1024,7 @@ export class SFTPPanel {
         label: t('sftp.contextOpen'),
         icon: 'open_in_new',
         action: () => {
-          if (entry.isDir) {
-            this.navigate(
-              this.currentPath === '/' ? `/${entry.name}` : `${this.currentPath}/${entry.name}`
-            );
-          } else {
-            this.downloadEntries([entry]);
-          }
+          void this.openEntry(entry, 'download');
         },
       });
       if (!entry.isDir) {
@@ -960,11 +1032,7 @@ export class SFTPPanel {
           label: t('sftp.contextEdit'),
           icon: 'edit_note',
           action: () => {
-            void this.openEditorForFile(
-              this.currentPath === '/' ? `/${entry.name}` : `${this.currentPath}/${entry.name}`,
-              entry.name,
-              entry.size
-            );
+            void this.openEntry(entry, 'edit');
           },
         });
       }
@@ -1123,7 +1191,20 @@ export class SFTPPanel {
 
     let sendOffset = 0;
     let acknowledged = 0;
-    const maxBufferedBytes = UPLOAD_CHUNK_SIZE * UPLOAD_CONCURRENCY;
+    let resumeOffset = 0;
+    const hasher = new StreamingSHA256();
+
+    // Carrier framing is independent; keep the browser/Worker pipeline policy aligned.
+    const uploadPolicy = getSFTPUploadPolicy(this.isTunnel);
+    const chunkSize = uploadPolicy.chunkSize;
+    let currentWindowBytes = uploadPolicy.initialWindowBytes;
+    const MIN_WINDOW_BYTES = uploadPolicy.minWindowBytes;
+    const MAX_WINDOW_BYTES = uploadPolicy.maxWindowBytes;
+    const windowStepBytes = uploadPolicy.windowStepBytes;
+    let lastAckTime = performance.now();
+    let lastAckBytes = 0;
+    let smoothedSpeed = 0;
+
     let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     let pendingChunk: Uint8Array | null = null;
     let pendingChunkOffset = 0;
@@ -1140,34 +1221,95 @@ export class SFTPPanel {
       let startResult = await readyPromise;
 
       if (startResult.status === 'conflict') {
-        const confirmed = await confirmAction({
-          title: t('sftp.overwriteTitle'),
-          message: t('sftp.overwriteMessage', {
-            name: file.name,
-            existingSize: this.formatSize(startResult.conflict.existingSize),
-            newSize: this.formatSize(file.size),
-          }),
-          confirmText: t('sftp.overwrite'),
-          cancelText: t('common.cancel'),
-          variant: 'danger',
-        });
-        if (!confirmed || this.uploadCancelRequested || !this.visible) {
-          this.uploadActive = false;
-          this.setIdleStatus(t('sftp.uploadSkipped'));
-          return false;
+        const existingSize = startResult.conflict.existingSize;
+        const canResume = existingSize > 0 && existingSize < file.size;
+
+        if (canResume) {
+          const wantResume = await confirmAction({
+            title: t('sftp.resumeTitle'),
+            message: t('sftp.resumeMessage', {
+              name: file.name,
+              existingSize: this.formatSize(existingSize),
+              totalSize: this.formatSize(file.size),
+              percent: Math.round((existingSize / file.size) * 100),
+            }),
+            confirmText: t('sftp.resumeAction'),
+            cancelText: t('sftp.otherOptions'),
+            variant: 'info',
+          });
+
+          if (this.uploadCancelRequested || !this.visible) {
+            this.uploadActive = false;
+            this.setIdleStatus(t('sftp.uploadSkipped'));
+            return false;
+          }
+
+          if (wantResume) {
+            resumeOffset = existingSize;
+            const resumeReadyPromise = this.uploadWaiter.waitReady();
+            this.sendJSON({
+              type: 'sftp_upload_start',
+              path,
+              size: file.size,
+              overwrite: false,
+              resumeOffset,
+            });
+            startResult = await resumeReadyPromise;
+          }
         }
 
-        const overwriteReadyPromise = this.uploadWaiter.waitReady();
-        this.sendJSON({ type: 'sftp_upload_start', path, size: file.size, overwrite: true });
-        startResult = await overwriteReadyPromise;
+        if (resumeOffset === 0) {
+          const confirmed = await confirmAction({
+            title: t('sftp.overwriteTitle'),
+            message: t('sftp.overwriteMessage', {
+              name: file.name,
+              existingSize: this.formatSize(existingSize),
+              newSize: this.formatSize(file.size),
+            }),
+            confirmText: t('sftp.overwrite'),
+            cancelText: t('common.cancel'),
+            variant: 'danger',
+          });
+          if (!confirmed || this.uploadCancelRequested || !this.visible) {
+            this.uploadActive = false;
+            this.setIdleStatus(t('sftp.uploadSkipped'));
+            return false;
+          }
+
+          const overwriteReadyPromise = this.uploadWaiter.waitReady();
+          this.sendJSON({ type: 'sftp_upload_start', path, size: file.size, overwrite: true });
+          startResult = await overwriteReadyPromise;
+        }
       }
 
       if (startResult.status !== 'ready') {
         throw new Error(t('sftp.uploadConflictUnresolved'));
       }
 
-      reader = file.stream().getReader();
-      this.showProgress(t('sftp.uploading', { name: file.name }), 0);
+      if (resumeOffset > 0) {
+        // 对已有远端数据前缀进行流式哈希累加
+        const prefixBlob = file.slice(0, resumeOffset);
+        const prefixReader = prefixBlob.stream().getReader();
+        while (true) {
+          const { done, value } = await prefixReader.read();
+          if (done) break;
+          if (value) hasher.update(value);
+        }
+        prefixReader.releaseLock();
+
+        reader = file.slice(resumeOffset).stream().getReader();
+        sendOffset = resumeOffset;
+        acknowledged = resumeOffset;
+        lastAckBytes = resumeOffset;
+      } else {
+        reader = file.stream().getReader();
+        sendOffset = 0;
+        acknowledged = 0;
+        lastAckBytes = 0;
+      }
+
+      const initialPercent = file.size > 0 ? (acknowledged / file.size) * 100 : 0;
+      this.showProgress(t('sftp.uploading', { name: file.name }), initialPercent);
       if (this.uploadCancelRequested) {
         await this.waitForUploadCancel();
         return false;
@@ -1181,9 +1323,10 @@ export class SFTPPanel {
           pendingChunkOffset = 0;
         }
 
-        const end = Math.min(pendingChunkOffset + UPLOAD_CHUNK_SIZE, pendingChunk.length);
+        const end = Math.min(pendingChunkOffset + chunkSize, pendingChunk.length);
         const chunk = pendingChunk.subarray(pendingChunkOffset, end);
         pendingChunkOffset = end;
+        hasher.update(chunk);
         return chunk;
       };
 
@@ -1198,31 +1341,79 @@ export class SFTPPanel {
         return true;
       };
 
-      while (sendOffset < file.size && sendOffset - acknowledged < maxBufferedBytes) {
+      while (sendOffset < file.size || acknowledged < file.size) {
         if (this.uploadCancelRequested) {
           await this.waitForUploadCancel();
           return false;
         }
-        if (!(await sendNextChunk())) {
-          throw new Error(t('sftp.uploadStreamEnded'));
-        }
-      }
 
-      while (acknowledged < file.size) {
-        acknowledged = await this.uploadWaiter.waitProgress();
-        if (this.uploadCancelRequested) {
-          await this.waitForUploadCancel();
-          return false;
-        }
-        while (sendOffset < file.size && sendOffset - acknowledged < maxBufferedBytes) {
+        // 1. 发送在途数据，直到填满当前动态窗口或已达文件末尾
+        while (sendOffset < file.size && sendOffset - acknowledged < currentWindowBytes) {
+          if (this.uploadCancelRequested) {
+            await this.waitForUploadCancel();
+            return false;
+          }
           if (!(await sendNextChunk())) {
             throw new Error(t('sftp.uploadStreamEnded'));
           }
         }
+
+        // 如果全部数据已发送并已得到全部确认，提前跳出
+        if (acknowledged >= file.size) break;
+
+        // 2. 等待服务端进度 ACK（带超时竞速保护，高延迟网络防死锁）
+        let progressAck: number | null = null;
+        let progressTimeoutId: ReturnType<typeof setTimeout> | undefined;
+
+        try {
+          progressAck = await Promise.race([
+            this.uploadWaiter.waitProgress(),
+            new Promise<null>((resolve) => {
+              progressTimeoutId = setTimeout(() => resolve(null), 4000);
+            }),
+          ]);
+        } finally {
+          if (progressTimeoutId) clearTimeout(progressTimeoutId);
+        }
+
+        if (this.uploadCancelRequested) {
+          await this.waitForUploadCancel();
+          return false;
+        }
+
+        if (progressAck !== null) {
+          acknowledged = progressAck;
+          const now = performance.now();
+          const durationSec = (now - lastAckTime) / 1000;
+          const deltaBytes = acknowledged - lastAckBytes;
+
+          if (durationSec > 0.05 && deltaBytes > 0) {
+            const instantSpeed = deltaBytes / durationSec;
+            // 针对高延迟抖动网络的指数平滑（EMA）
+            smoothedSpeed = smoothedSpeed === 0 ? instantSpeed : 0.8 * smoothedSpeed + 0.2 * instantSpeed;
+
+            // 针对高延迟 BDP（带宽时延积）网络的动态自适应窗口（慢启动与拥塞平滑）：
+            // 收到确认顺畅且延迟良好时（<1.5s），平滑累加扩容窗口；
+            // 延迟过大或抖动（>3.0s）时，适当按 0.85 比例平滑收缩，但绝不低于安全底线！
+            if (durationSec < 1.5) {
+              currentWindowBytes = Math.min(MAX_WINDOW_BYTES, currentWindowBytes + windowStepBytes);
+            } else if (durationSec > 3.0) {
+              currentWindowBytes = Math.max(MIN_WINDOW_BYTES, Math.floor(currentWindowBytes * 0.85));
+            }
+
+            lastAckTime = now;
+            lastAckBytes = acknowledged;
+            this.updateProgressWithSpeed(acknowledged, file.size, smoothedSpeed);
+          }
+        } else {
+          // 超时保护被触发（4秒内未收到 ACK）：温和提升窗口以打破潜在死锁
+          currentWindowBytes = Math.min(MAX_WINDOW_BYTES, currentWindowBytes + windowStepBytes);
+        }
       }
 
+      const expectedHash = hasher.digest();
       const completePromise = this.uploadWaiter.waitComplete();
-      this.sendJSON({ type: 'sftp_upload_end' });
+      this.sendJSON({ type: 'sftp_upload_end', expectedHash });
       await completePromise;
       return true;
     } catch (e) {
@@ -1319,6 +1510,8 @@ export class SFTPPanel {
     } finally {
       this.downloadActive = false;
       this.downloadCancelRequested = false;
+      this.downloadChunks = [];
+      this.downloadFilename = '';
     }
   }
 
@@ -1387,9 +1580,35 @@ export class SFTPPanel {
   private editSelected(): void {
     const selected = [...this.selectedEntries.values()];
     if (selected.length !== 1 || selected[0].isDir) return;
-    const entry = selected[0];
+    void this.openEntry(selected[0], 'edit');
+  }
+
+  private async openEntry(
+    entry: SFTPFileEntry,
+    action: 'open' | 'download' | 'edit' = 'open'
+  ): Promise<void> {
+    this.linkResolver.cancel();
+    if (!this.visible || !this.sftpReady) return;
     const path = this.currentPath === '/' ? `/${entry.name}` : `${this.currentPath}/${entry.name}`;
-    void this.openEditorForFile(path, entry.name, entry.size);
+    let isDir = entry.isDir;
+    let size = entry.size;
+    if (entry.isLink) {
+      const target = await this.linkResolver.resolve(path);
+      if (!target) return;
+      isDir = target.type === 'dir';
+      size = target.size;
+    }
+
+    // Target type is only for opening; never mutate isDir/type used by link deletion.
+    if (isDir) {
+      this.navigate(path);
+    } else if (action === 'download') {
+      this.queueDownloadFile(path, entry.name);
+    } else {
+      await this.openEditorForFile(path, entry.name, size, {
+        fallbackToDownload: action === 'open',
+      });
+    }
   }
 
   private openEditorForFile(
@@ -1412,7 +1631,8 @@ export class SFTPPanel {
   private cancelCurrentTransfer(): void {
     if (this.uploadActive) {
       this.uploadCancelRequested = true;
-      this.uploadCancelConfirmed = false;
+      this.uploadCancelConfirmed = true;
+      this.uploadWaiter.reject(t('sftp.uploadCancelled'));
       if (!this.uploadCancelWaiter) {
         this.uploadCancelWaiter = new Deferred<void>();
       }
@@ -1442,7 +1662,7 @@ export class SFTPPanel {
     this.uploadWaiter.resolveProgress(loaded);
   }
 
-  private onUploadComplete(_path: string): void {
+  private onUploadComplete(path?: string, _hash?: string, hashMatch?: boolean): void {
     this.uploadWaiter.resolveComplete();
     this.uploadActive = false;
     this.uploadCancelRequested = false;
@@ -1451,6 +1671,13 @@ export class SFTPPanel {
     this.hideProgress();
     this.setIdleStatus(this.getItemsStatus());
     this.refresh();
+
+    const filename = path ? path.split('/').pop() || path : '';
+    if (hashMatch === true && filename) {
+      notify(t('sftp.hashVerified', { name: filename }), { variant: 'success', duration: 3000 });
+    } else if (hashMatch === false && filename) {
+      notify(t('sftp.hashMismatch', { name: filename }), { variant: 'warning', duration: 6000 });
+    }
   }
 
   private onUploadCancelled(): void {
@@ -1667,7 +1894,7 @@ export class SFTPPanel {
   private showError(message: string): void {
     const errorEl = this.container.querySelector('#sftp-error')!;
     const errorText = this.container.querySelector('#sftp-error-text')!;
-    errorText.textContent = message;
+    errorText.textContent = formatSFTPErrorMessage(message);
     errorEl.classList.remove('hidden');
     errorEl.classList.add('flex');
     this.hideLoading();
@@ -1689,6 +1916,46 @@ export class SFTPPanel {
     progressText.textContent = text;
     progressPercent.textContent = Math.round(percent) + '%';
     progressBar.style.width = percent + '%';
+  }
+
+  private formatSpeed(bytesPerSec: number): string {
+    if (bytesPerSec <= 0) return '';
+    return `${this.formatSize(bytesPerSec)}/s`;
+  }
+
+  private formatETA(seconds: number): string {
+    if (!Number.isFinite(seconds) || seconds <= 0) return '';
+    if (seconds < 60) return t('sftp.etaSeconds', { seconds });
+    if (seconds < 3600) {
+      const minutes = Math.floor(seconds / 60);
+      const remainingSec = Math.floor(seconds % 60);
+      return t('sftp.etaMinutes', { minutes, seconds: remainingSec });
+    }
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    return t('sftp.etaHours', { hours, minutes });
+  }
+
+  private updateProgressWithSpeed(loaded: number, total: number, bytesPerSec?: number): void {
+    const percent = total > 0 ? (loaded / total) * 100 : 0;
+    const progressPercent = this.container.querySelector('#sftp-progress-percent')!;
+    const progressBar = this.container.querySelector('#sftp-progress-bar')! as HTMLElement;
+    const progressText = this.container.querySelector('#sftp-progress-text')!;
+
+    progressPercent.textContent = Math.round(percent) + '%';
+    progressBar.style.width = percent + '%';
+
+    const loadedStr = this.formatSize(loaded);
+    const totalStr = this.formatSize(total);
+    const speedStr = bytesPerSec && bytesPerSec > 0 ? ` · ${this.formatSpeed(bytesPerSec)}` : '';
+    const remainingBytes = total - loaded;
+    const etaStr =
+      bytesPerSec && bytesPerSec > 0 && remainingBytes > 0
+        ? ` · ${this.formatETA(Math.ceil(remainingBytes / bytesPerSec))}`
+        : '';
+
+    const baseTitle = progressText.textContent?.replace(/\(.*/, '').trim() || '';
+    progressText.textContent = `${baseTitle} (${loadedStr} / ${totalStr}${speedStr}${etaStr})`;
   }
 
   private updateProgress(loaded: number, total: number): void {
@@ -1780,6 +2047,8 @@ export class SFTPPanel {
     this.editorCoordinator.dispose();
     this.closeWebSocket(1000, 'SFTP panel disposed');
     document.removeEventListener('keydown', this.keydownHandler);
+    this.entryRows.clear();
+    this.highlightedNames.clear();
     this.container.remove();
   }
 }

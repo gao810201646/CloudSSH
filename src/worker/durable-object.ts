@@ -11,6 +11,7 @@ import {
 } from '../share-resume-schema';
 import { checkHostResolved } from './dns-check';
 import { SSHSession } from './ssh-session';
+import { isValidTunnelHostname, TunnelWebSocketStream } from './tunnel-stream';
 
 /**
  * SSRF 防护：检测目标主机是否为内网、保留或特殊地址。
@@ -111,6 +112,14 @@ export class SSHSessionDO {
       url = new URL(request.url);
     } catch {
       return new Response('Invalid request', { status: 400 });
+    }
+    if (url.pathname === '/internal/mcp-context' && request.method === 'POST') {
+      const input = await request.json<{ userId: number; routeKey: string; serverId: number; enabled?: boolean; inspect?: boolean; lastLines?: number }>();
+      for (const session of this.sessions.values()) {
+        const result = session.mcpContext(input);
+        if (result) return Response.json(result);
+      }
+      return Response.json({ error: 'context_unavailable' }, { status: 404 });
     }
     if (url.pathname === '/internal/revoke-share' && request.method === 'POST') {
       const body = await request.json<{ shareId?: string }>();
@@ -230,7 +239,7 @@ export class SSHSessionDO {
     try {
       const session = this.sessions.get(ws);
       if (session) {
-        // agent_confirm / agent_stop 需要绕过阻塞的 handleAgentStart 处理
+        // agent_confirm / agent_stop / agent_reset 需要绕过阻塞的 handleAgentStart 处理
         if (typeof message === 'string') {
           let msg: any;
           try {
@@ -238,7 +247,10 @@ export class SSHSessionDO {
           } catch {
             /* not JSON */
           }
-          if (msg && (msg.type === 'agent_confirm' || msg.type === 'agent_stop')) {
+          if (
+            msg &&
+            (msg.type === 'agent_confirm' || msg.type === 'agent_stop' || msg.type === 'agent_reset')
+          ) {
             session.handleAgentControl(msg.type, msg);
             return;
           }
@@ -290,10 +302,29 @@ export class SSHSessionDO {
       delete config.knownHostIdentity;
       delete config.sessionPolicy;
 
-      if (!config.host || !config.username || (!config.password && !config.privateKey)) {
+      if (config.transportType === 'cf_tunnel') {
+        if (!config.host && config.cfTunnelHost) {
+          config.host = config.cfTunnelHost;
+        }
+      }
+
+      // An explicit empty password is valid; missing/non-string credentials are not.
+      const hasCredentials =
+        config.authMethod === 'none' ||
+        (config.authMethod === 'publickey'
+          ? typeof config.privateKey === 'string' && config.privateKey.length > 0
+          : (config.authMethod === undefined || config.authMethod === 'password') &&
+            typeof config.password === 'string');
+      if (!config.host || !config.username || !hasCredentials) {
         ws.send(JSON.stringify({ type: 'error', message: 'Missing credentials' }));
         ws.close(1011, 'Invalid credentials');
         return;
+      }
+
+      if (config.authMethod === 'none') {
+        config.password = '';
+        delete config.privateKey;
+        delete config.certificate;
       }
 
       const pendingSessionName = this.pendingSessionNames.get(ws);
@@ -400,6 +431,11 @@ export class SSHSessionDO {
       return resumeReject(404, 'Session expired or not found');
     }
 
+    const policy = detached.session.getSessionPolicy();
+    if (request.headers.get('x-ssh-share-resume-only') === 'true' && policy?.source !== 'share') {
+      return resumeReject(401, 'Authentication required');
+    }
+
     // 容忍一代旧 token：弱网下轮换帧可能随新连接一起丢失，客户端会携带
     // 上一代 token 重试；直接锁死会造成永久 403。新旧两代均需过后续校验。
     const currentResumeToken = detached.resumeToken;
@@ -414,7 +450,6 @@ export class SSHSessionDO {
     }
 
     // 分享会话附加策略校验：绝对过期复核 + 设备绑定挑战验签。
-    const policy = detached.session.getSessionPolicy();
     if (policy?.source === 'share') {
       if (Date.now() >= policy.sessionExpiresAt) {
         // 宽限期内到达分享会话绝对结束时间：立即终结，不再允许恢复。
@@ -605,40 +640,141 @@ export class SSHSessionDO {
   ): Promise<void> {
     const chainSessions: SSHSession[] = [];
     try {
+      const isTunnel = config.transportType === 'cf_tunnel';
       const jumpHosts = config.jumpHosts || [];
       if (jumpHosts.length > 3) throw new Error('最多允许 3 级 SSH 跳转');
-      const outer = jumpHosts[0] || config;
-      if (!Number.isInteger(outer.port) || outer.port < 1 || outer.port > 65535) {
-        throw new Error('端口必须是 1-65535 之间的整数');
+      if (isTunnel && jumpHosts.length > 0) {
+        throw new Error('Cloudflare 隧道连接不支持跳板机');
       }
-      // SSRF checks apply to the only address reached directly from Cloudflare.
-      // Private destinations are allowed only inside a trusted saved-server chain.
-      if (isBlockedHost(outer.host)) {
-        throw new Error('禁止连接内网或保留地址 (SSRF 防护)');
-      }
-      const dnsCheck = await checkHostResolved(outer.host);
-      if (dnsCheck.blocked) {
-        throw new Error(dnsCheck.reason!);
-      }
+
       const BLOCKED_PORTS = [
         23, 80, 443, 25, 465, 587, 110, 143, 993, 995, 3306, 5432, 6379, 9200, 11211, 27017, 5060,
       ];
-      for (const node of [...jumpHosts, config]) {
-        if (!Number.isInteger(node.port) || node.port < 1 || node.port > 65535) {
+
+      const debugMode = this.env.DEBUG_MODE === 'true';
+
+      let transport: any;
+      let latency = 0;
+
+      if (isTunnel) {
+        const tunnelHost = (config.cfTunnelHost || config.host || '')
+          .trim()
+          .replace(/^(https?|wss?):\/\//i, '')
+          .replace(/\/.*$/, '')
+          .replace(/:\d+$/, '');
+
+        if (!tunnelHost) {
+          throw new Error('Cloudflare 隧道域名不能为空');
+        }
+        if (!isValidTunnelHostname(tunnelHost)) {
+          throw new Error(
+            'Cloudflare 隧道域名格式不正确，必须为有效的公开域名（例如 ssh.example.com）'
+          );
+        }
+        if (isBlockedHost(tunnelHost)) {
+          throw new Error('禁止连接内网或保留地址 (SSRF 防护)');
+        }
+        const dnsCheck = await checkHostResolved(tunnelHost);
+        if (dnsCheck.blocked) {
+          throw new Error(dnsCheck.reason!);
+        }
+
+        const tunnelUrl = `https://${tunnelHost}/`;
+        const headers: Record<string, string> = {};
+        headers.Upgrade = 'websocket';
+        headers.Connection = 'Upgrade';
+        headers['Sec-WebSocket-Version'] = '13';
+        const clientId = (config.cfAccessClientId || '').trim();
+        const clientSecret = (config.cfAccessClientSecret || '').trim();
+        if (clientId) {
+          headers['CF-Access-Client-Id'] = clientId;
+        }
+        if (clientSecret) {
+          headers['CF-Access-Client-Secret'] = clientSecret;
+        }
+
+        const startTime = Date.now();
+        let resp: Response;
+        try {
+          // redirect: 'manual' 是必需项：默认 follow 会把 Zero Trust 的 302 跟随到
+          // 登录页（使下方 3xx 诊断分支失效），并把 Service Token 转发给重定向目标。
+          resp = await fetch(tunnelUrl, { headers, redirect: 'manual' });
+        } catch (fetchErr) {
+          const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+          throw new Error(`Cloudflare 隧道连接失败 (${tunnelHost}): ${msg}`);
+        }
+
+        if (resp.status === 401 || resp.status === 403) {
+          const cfRay = resp.headers.get('cf-ray');
+          const hasCredentials = Boolean(clientId && clientSecret);
+          const detail = hasCredentials
+            ? `已携带 Service Token (Client ID: ${clientId})，但访问被拒绝 (${resp.status})`
+            : `未配置完整的 Service Token 凭据 (Client ID: ${clientId ? '已配置' : '未配置'}, Client Secret: ${clientSecret ? '已配置' : '未配置'})`;
+          const rayInfo = cfRay ? ` [CF-RAY: ${cfRay}]` : '';
+          throw new Error(
+            `Cloudflare Zero Trust 访问被拒绝 (${resp.status})：${detail}${rayInfo}。若启用了 Access 保护，请在 Cloudflare Zero Trust 中确保包含该 Service Token 策略 (Action: Service Auth) 并在服务器设置中正确填入。`
+          );
+        }
+        if (resp.status === 301 || resp.status === 302) {
+          const cfRay = resp.headers.get('cf-ray');
+          const rayInfo = cfRay ? ` [CF-RAY: ${cfRay}]` : '';
+          throw new Error(
+            `Cloudflare 隧道被重定向到认证页面 (${resp.status})${rayInfo}：若启用了 Zero Trust 访问控制，请在 Cloudflare 配置 Service Token (Policy Action: Service Auth) 并在服务器设置中填入`
+          );
+        }
+
+        const tunnelWs = resp.webSocket;
+        if (!tunnelWs) {
+          const cfRay = resp.headers.get('cf-ray');
+          const rayInfo = cfRay ? ` [CF-RAY: ${cfRay}]` : '';
+          throw new Error(
+            `Cloudflare 隧道未能升级为 WebSocket (HTTP ${resp.status} ${resp.statusText})${rayInfo}`
+          );
+        }
+
+        tunnelWs.accept();
+        transport = new TunnelWebSocketStream(tunnelWs, (msg) => {
+          if (debugMode) {
+            try {
+              ws.send(JSON.stringify({ type: 'debug', message: msg }));
+            } catch {
+              /* ignore */
+            }
+          }
+        });
+        await transport.opened;
+        latency = Date.now() - startTime;
+      } else {
+        const outer = jumpHosts[0] || config;
+        if (!Number.isInteger(outer.port) || outer.port < 1 || outer.port > 65535) {
           throw new Error('端口必须是 1-65535 之间的整数');
         }
-        if (BLOCKED_PORTS.includes(node.port)) {
-          throw new Error(`端口 ${node.port} 存在安全风险，已被禁止连接`);
+        // SSRF checks apply to the only address reached directly from Cloudflare.
+        // Private destinations are allowed only inside a trusted saved-server chain.
+        if (isBlockedHost(outer.host)) {
+          throw new Error('禁止连接内网或保留地址 (SSRF 防护)');
         }
+        const dnsCheck = await checkHostResolved(outer.host);
+        if (dnsCheck.blocked) {
+          throw new Error(dnsCheck.reason!);
+        }
+        for (const node of [...jumpHosts, config]) {
+          if (!Number.isInteger(node.port) || node.port < 1 || node.port > 65535) {
+            throw new Error('端口必须是 1-65535 之间的整数');
+          }
+          if (BLOCKED_PORTS.includes(node.port)) {
+            throw new Error(`端口 ${node.port} 存在安全风险，已被禁止连接`);
+          }
+        }
+
+        const { connect } = await import('cloudflare:sockets');
+        const hostname = outer.host.includes(':') ? `[${outer.host}]` : outer.host;
+
+        const startTime = Date.now();
+        transport = connect({ hostname, port: outer.port });
+        await transport.opened;
+        latency = Date.now() - startTime;
       }
-
-      const { connect } = await import('cloudflare:sockets');
-      const hostname = outer.host.includes(':') ? `[${outer.host}]` : outer.host;
-
-      const startTime = Date.now();
-      let transport: any = connect({ hostname, port: outer.port });
-      await transport.opened;
-      const latency = Date.now() - startTime;
 
       const colo = this.websocketColos.get(ws) || 'UNKNOWN';
       this.websocketColos.delete(ws);
@@ -649,7 +785,6 @@ export class SSHSessionDO {
         config.sessionPolicy?.source === 'share'
           ? true
           : this.env.STRICT_HOST_KEY_VERIFY !== 'false';
-      const debugMode = this.env.DEBUG_MODE === 'true';
       const pendingSize = this.pendingTerminalSizes.get(ws);
       if (pendingSize) {
         config.cols = pendingSize.cols;
@@ -731,7 +866,13 @@ export class SSHSessionDO {
         this.env,
         config.userId,
         config.githubId,
-        { waitUntil: (promise) => this.state.waitUntil(promise) }
+        {
+          waitUntil: (promise) => this.state.waitUntil(promise),
+          colo,
+          onRttUpdated: (latestLatency, latestColo) => {
+            this.sessionBaselines.set(session, { latencyMs: latestLatency, colo: latestColo });
+          },
+        }
       );
       chainSessions.push(session);
       this.sessionChains.set(ws, chainSessions);
